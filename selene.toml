@@ -1,0 +1,21 @@
+# Static analysis for the three panes.
+#
+# `std = "thurbox"` names `thurbox.yml`, the plugin VM's real standard library:
+# the stdlib tables the kernel grants plus its injected globals, with everything
+# it withholds marked removed. So this checks two things at once — that the Lua
+# is sound, and that no pane reaches for a capability the sandbox does not have.
+#
+# The file itself is NOT vendored here. `ci/assemble-interface.sh` copies it out
+# of the thurbox checkout at the tag these panes are tested against, because a
+# vendored copy would drift from the VM it claims to describe without anything
+# failing.
+std = "thurbox"
+
+[lints]
+# A pane is one file returning one table; the kernel calls its fields. Nothing
+# else references them, which is not "unused". Same rule the bundled panes use.
+unused_variable = "warn"
+shadowing = "allow"
+almost_swapped = "deny"
+undefined_variable = "deny"
+unscoped_variables = "deny"

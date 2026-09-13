@@ -1,0 +1,67 @@
+# What CI can prove about a pane without a screen.
+#
+# `selene` reads the plugin VM's real standard library, so it catches a pane
+# reaching for something the sandbox withholds. `plugin check` loads the
+# interface the way the TUI does, in the layout a real install produces, and
+# fails when a pane loads but nothing places it — the failure a user would
+# otherwise meet as an empty column.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The thurbox release these panes are tested against. One place, because the
+# binary and the `ui/` tree it loads have to be the same version: a pane reads
+# `thurbox.*`, and that is a contract that moves.
+env:
+  THURBOX_TAG: v2.22.4
+
+jobs:
+  lint:
+    name: Lua
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Thurbeen/thurbox
+          ref: ${{ env.THURBOX_TAG }}
+          path: .thurbox
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: selene,stylua
+      # `selene.toml` says `std = "thurbox"`, which resolves to `thurbox.yml`
+      # beside it. Taken from the checkout rather than vendored so it cannot
+      # drift from the VM it describes.
+      - run: cp .thurbox/thurbox.yml .
+      - run: selene plugins
+      - run: stylua --check plugins
+
+  loads:
+    name: Interface loads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Thurbeen/thurbox
+          ref: ${{ env.THURBOX_TAG }}
+          path: .thurbox
+      - name: Fetch thurbox-cli from the release
+        run: |
+          curl -sSfL -o thurbox.tar.gz \
+            "https://github.com/Thurbeen/thurbox/releases/download/${THURBOX_TAG}/thurbox-${THURBOX_TAG}-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf thurbox.tar.gz thurbox-cli
+      - name: Assemble the interface an install produces
+        run: ci/assemble-interface.sh .thurbox build/ui
+      - name: Load it
+        # XDG pointed at the workspace so the check cannot read or write a real
+        # interface, and `THURBOX_UI_DIR` because the assembled tree is the
+        # subject. A pane that loads but is never placed exits non-zero.
+        env:
+          XDG_CONFIG_HOME: ${{ github.workspace }}/build/xdg-config
+          XDG_DATA_HOME: ${{ github.workspace }}/build/xdg-data
+          THURBOX_UI_DIR: ${{ github.workspace }}/build/ui
+        run: ./thurbox-cli plugin check --text

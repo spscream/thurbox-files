@@ -2,3 +2,12 @@
 # `thurbox-cli plugin update` report `kept` and refuse to move. Anything this
 # plugin produces goes to $XDG_CACHE_HOME/thurbox-files/ instead.
 *.log
+
+# Fetched from the thurbox checkout by CI (and by you, to run selene locally) —
+# see selene.toml on why it is not vendored.
+/thurbox.yml
+# What ci/assemble-interface.sh builds.
+/build/
+/.thurbox/
+/thurbox-cli
+/thurbox.tar.gz

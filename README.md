@@ -82,6 +82,30 @@ fork — `+594 / -2`. When upstream changes the pane, that base commit is the me
 base, so taking the change is a git merge rather than a re-read of two 1500-line
 files.
 
+## Checks
+
+Two jobs, both of which a pane can fail without anyone opening a terminal.
+
+- **Lua** — `selene` against `thurbox.yml`, the plugin VM's real standard
+  library, so a pane reaching for something the sandbox withholds is a lint
+  failure rather than a nil three frames later; plus `stylua --check`.
+- **Interface loads** — `ci/assemble-interface.sh` builds the directory a real
+  install produces (thurbox's `ui/` as the base, this repository beside it, the
+  bundled agent pane deleted, the `files` slot placed) and runs
+  `thurbox-cli plugin check` against it. A pane that loads but that nothing
+  places exits non-zero, which is the "empty column" failure caught early.
+
+Both run against the release named by `THURBOX_TAG` in the workflow — the binary
+and the `ui/` tree it loads have to be the same version. Locally:
+
+```bash
+git clone --depth 1 --branch v2.22.4 https://github.com/Thurbeen/thurbox .thurbox
+cp .thurbox/thurbox.yml .          # what selene.toml's `std = "thurbox"` resolves to
+selene plugins && stylua --check plugins
+ci/assemble-interface.sh .thurbox build/ui
+THURBOX_UI_DIR=$PWD/build/ui thurbox-cli plugin check
+```
+
 ## Licence
 
 MIT. `plugins/20_agent.lua` derives from thurbox's bundled pane, also MIT,
