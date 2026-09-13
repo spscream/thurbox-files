@@ -14,7 +14,9 @@ on:
 
 # The thurbox release these panes are tested against. One place, because the
 # binary and the `ui/` tree it loads have to be the same version: a pane reads
-# `thurbox.*`, and that is a contract that moves.
+# `thurbox.*`, and that is a contract that moves. Raising it also means the
+# README: its version badge and its `git clone --branch` recipe say this number
+# out loud, and nothing here fails if they drift.
 env:
   THURBOX_TAG: v2.22.4
 

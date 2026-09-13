@@ -1,5 +1,9 @@
 # thurbox-files
 
+[![CI](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml/badge.svg)](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml)
+[![thurbox v2.22.4](https://img.shields.io/badge/thurbox-v2.22.4-2aa198)](https://github.com/Thurbeen/thurbox/releases/tag/v2.22.4)
+[![licence MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+
 A file column for [thurbox](https://github.com/Thurbeen/thurbox) v2, and the two
 tabs on the agent pane that make it useful: a file opens in an editor beside the
 agent, and a changed file opens its diff there.
