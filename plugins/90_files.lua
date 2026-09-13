@@ -336,6 +336,31 @@ local function git_index(session, refresh)
   return index
 end
 
+--- Rows the kernel called files and this pane has since seen list like
+--- directories: symlinks to directories, keyed `session\0path`.
+---
+--- `files.list` reports `dir` from the directory ENTRY — `DirEntry::file_type`,
+--- which by definition does not follow a symlink — so a link to a directory
+--- arrives here as a leaf. Drawn as a file it is only odd; ACTED on as a file it
+--- is the bug this answers, because Enter hands a leaf's path to the editor and
+--- the editor opened a directory listing in the tab.
+---
+--- The pane has no filesystem and cannot look. It can ASK, though: `files.list`
+--- on the row's own path succeeds exactly when that path is a directory once
+--- the link is followed, and the kernel still refuses anything outside the
+--- session. So the question is put once per row, on the press, and remembered —
+--- a directory read per frame is what the memo below exists to avoid.
+---
+--- A link pointing OUTSIDE the session is not covered and cannot be from here:
+--- the kernel refuses to read it at all, and its refusal is the same whether the
+--- target is a file or a directory. Such a row still goes to the editor, which
+--- is what it did before.
+local linked = {}
+
+local function link_key(session, path)
+  return session .. "\0" .. path
+end
+
 --- Directories first, then names, both case-insensitively — the order a file
 --- tree is read in, not the order the filesystem happened to hand back.
 local function listing(session, path)
@@ -429,14 +454,21 @@ local function visible_rows(session)
     end
     for _, entry in ipairs(listed) do
       local full = join(path, entry.name)
-      local is_open = entry.dir and open[full] or false
+      -- A symlinked directory is corrected HERE and not in `listing`, so it
+      -- keeps the place among the files that the kernel's sort gave it.
+      -- Correcting it before the sort was measured first and is worse: the row
+      -- moves up into the directories the moment it is discovered, the cursor
+      -- stays at the index it was on, and the next Enter lands on whatever slid
+      -- into that place — `src`, in the run that showed it.
+      local dir = entry.dir or linked[link_key(session, full)] or false
+      local is_open = dir and open[full] or false
       rows[#rows + 1] = {
         -- The identity is the PATH, not the name: two directories may both
         -- hold a `README.md`, and a cursor keyed by name would jump between
         -- them when one of them opened.
         path = full,
         name = entry.name,
-        dir = entry.dir,
+        dir = dir,
         depth = depth,
         open = is_open,
       }
@@ -527,11 +559,32 @@ local function warm_editor()
   command("emit", { text = "editorwarm", session = session })
 end
 
+--- Does a row the kernel called a file list like a directory?
+---
+--- Asked only about leaves, only on a press, and remembered either way: `false`
+--- is the answer for every ordinary file, and caching it is what keeps a second
+--- click on the same file from paying for the question again.
+local function lists_as_dir(session, path)
+  local key = link_key(session, path)
+  local known = linked[key]
+  if known ~= nil then
+    return known
+  end
+  local ok = pcall(files.list, session, path)
+  linked[key] = ok
+  if ok then
+    -- The row is about to draw as a directory, and the walk that decides that
+    -- is memoized on a signature this discovery is not part of.
+    invalidate()
+  end
+  return ok
+end
+
 local function activate(session, item, clicked)
   if not item then
     return true
   end
-  if item.dir then
+  if item.dir or lists_as_dir(session, item.path) then
     local open = expanded_set()
     -- Not `= not open[...]`: the set is written back WHOLE, and `false` in it
     -- would be a key present with a falsy value — `nil` is what "closed" means
@@ -1313,6 +1366,10 @@ return {
       -- looking at something stale", and a failure still on screen after it
       -- would be exactly that.
       state.opkey, state.oplabel = nil, nil
+      -- Including what this pane worked out about symlinks: `r` means "read it
+      -- again", and a link that has since become an ordinary file is exactly
+      -- the kind of stale this key is pressed about.
+      linked = {}
       invalidate()
       -- `refresh` overrides freshness, which is the whole difference between
       -- this and the poll: the poll is asking, this is insisting.
