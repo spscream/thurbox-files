@@ -1113,7 +1113,7 @@ local function diff_body(session, width, height, level, border, strip, reserved_
     return body
   end
 
-  if not thurbox.granted.run then
+  if not (thurbox.granted or {}).run then
     return say({
       { { text = "not trusted to read git", style = { fg = theme.bad, bold = true } } },
       { { text = "F6 → ] → t grants it to this file", style = { fg = theme.muted } } },
@@ -1184,7 +1184,7 @@ local function editor_body(session, width, level, border, strip, reserved_left)
     return body
   end
 
-  if not thurbox.granted.program then
+  if not (thurbox.granted or {}).program then
     -- Honest rather than blank: the pane cannot grant itself the capability and
     -- must not pretend it did.
     return say({
@@ -1271,7 +1271,7 @@ local function ensure_editor(id, path, keep)
   end
   set_file(id, path)
   remember_tab(id)
-  if not thurbox.granted.program then
+  if not (thurbox.granted or {}).program then
     command("message", {
       text = "the central pane needs the program capability — F6 → ] → t",
       level = "error",
