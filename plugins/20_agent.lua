@@ -55,6 +55,29 @@ end
 
 local AGENT_TAB, SHELL_TAB = "agent", "shell"
 local SELECT_AGENT, SELECT_SHELL = "terminal.agent", "terminal.shell"
+--- The third view, which is where v1's `Review · F7` chip used to point.
+---
+--- It is a tab of THIS pane rather than a plugin of its own for the reason the
+--- header gives about the shell: a second occupant of the `switch` slot draws
+--- over this one entire, so it loses the strip, gains a stop in the focus ring
+--- and needs a slot arbitration to referee the two. Built that way first, it
+--- read as a window on top of the terminal rather than a third tab beside it —
+--- which is exactly the complaint the header was already recording.
+local EDITOR_TAB, SELECT_EDITOR = "editor", "terminal.editor"
+--- The kernel's name for the program this pane owns, and the same string a
+--- `surface` node names to show its cells. One key, so asking again under it is
+--- addressed to the pane already standing there.
+local EDITOR_PROGRAM = "editor"
+
+--- The fourth tab: one file's diff, opened from the sidebar's changes list.
+---
+--- A tab here rather than a pane of its own for the same reason the editor is
+--- one — the sidebar is 22% of the screen and a diff is a wide thing — and
+--- because the strip that gets you back to the agent is drawn on THIS pane's
+--- border, so a second occupant of the centre slot would lose it.
+local DIFF_TAB, SELECT_DIFF = "diff", "terminal.diff"
+--- Toggling into the editor and back out, for the chord rather than the chip.
+local EDITOR_OPEN = "editor.open"
 --- Scrollback, declared rather than matched inside `on_key`: a key that only
 --- exists there is invisible to help and cannot be rebound.
 local SCROLL_UP, SCROLL_DOWN = "terminal.scroll_up", "terminal.scroll_down"
@@ -95,12 +118,247 @@ local function set_tab(id, tab)
   state["tab:" .. id] = tab ~= AGENT_TAB and tab or nil
 end
 
+--- The file the editor tab is showing, per session and for the same reason the
+--- tab is: opening a file in one session must not point the next one at it.
+---
+--- Absent means the tab has nothing to show, which is what the chip is gated on
+--- — v1's rule for the review chip, that an affordance which lights up and then
+--- does nothing is worse than no affordance.
+local function file_of(id)
+  if not id then
+    return nil
+  end
+  return state["file:" .. id]
+end
+
+local function set_file(id, path)
+  state["file:" .. id] = path
+end
+
+--- What the diff tab is showing, per session: a path relative to the session's
+--- working directory, and which side of the index it was asked about.
+---
+--- Two keys rather than one packed string: `git diff` and `git diff --cached`
+--- are different answers about the same path, and a row in the sidebar knows
+--- which one the user clicked.
+local function diff_of(id)
+  if not id then
+    return nil
+  end
+  return state["diff:" .. id], state["diffstaged:" .. id] == true, state["diffnew:" .. id] == true
+end
+
+local function set_diff(id, path, staged, untracked)
+  state["diff:" .. id] = path
+  state["diffstaged:" .. id] = staged and true or nil
+  -- Which git can answer about this path at all — see `diff_lines`.
+  state["diffnew:" .. id] = untracked and true or nil
+  -- A new file starts at the top. Without this the previous file's scroll
+  -- position is inherited, which for a short diff is a blank pane.
+  state["diffat:" .. id] = nil
+end
+
+--- Single quotes for `sh -c`, which is what `run` hands the program to.
+---
+--- `run` takes ONE string, not an argv the multiplexer quotes for you — the
+--- split the `program` command makes for exactly this reason is not available
+--- here, so a path with a space, a quote or a `$` in it is this function's
+--- problem. The `'\''` dance is the only escape a single-quoted POSIX string
+--- has.
+local function shell_quote(text)
+  -- Parenthesised: `gsub` returns the count as a second value, and a bare call
+  -- at the END of a concatenation would drag it in.
+  return "'" .. (tostring(text):gsub("'", "'\\''")) .. "'"
+end
+
+--- The diff for one file, as styled lines, or nil while there is no answer.
+---
+--- The run key carries the PATH and the side, not just the session: `run`
+--- dedupes on the key, so a single `diff:<id>` key would hand back the previous
+--- file's diff for as long as its answer stayed fresh.
+local function diff_lines(id, path, staged, untracked)
+  if not run or not id or not path then
+    return nil
+  end
+  -- An untracked file has no blob to diff against, so plain `git diff` prints
+  -- nothing for it — which the pane would have to render as "no changes" about
+  -- a file that is entirely new. `--no-index` against `/dev/null` compares two
+  -- paths on disk instead of consulting the index, and reads the whole file as
+  -- added, which is what the sidebar's `U` actually means. It exits 1 when the
+  -- two differ, i.e. always here; that is why the answer below is read from
+  -- `stdout` without consulting `ok`.
+  local program
+  if untracked then
+    program = "git --no-pager diff --no-color --no-index -- /dev/null " .. shell_quote(path)
+  else
+    program = "git --no-pager diff --no-color "
+      .. (staged and "--cached " or "")
+      .. "-- "
+      .. shell_quote(path)
+  end
+  -- The flag is in the key too: `git add` flips a path from one command to the
+  -- other, and within the ttl the old key would hand back the other shape.
+  local key = "diff:"
+    .. id
+    .. "\0"
+    .. (staged and "1" or "0")
+    .. (untracked and "n" or "-")
+    .. "\0"
+    .. path
+  run(key, program, { session = id, ttl = 3 })
+  local answer = (thurbox.runs or {})[key]
+  if not answer or answer.state ~= "done" then
+    return nil
+  end
+  local out = answer.stdout or ""
+  local lines = {}
+  for line in (out .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  -- A trailing empty line from the split, not a line of the diff.
+  if #lines > 0 and lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  return lines
+end
+
+--- The colour of one diff line, by its first character.
+---
+--- `+++`/`---` are checked BEFORE `+`/`-`: they are file headers, not an added
+--- and a removed line, and painting them green and red is the one thing that
+--- makes a diff harder to read rather than easier.
+local function diff_style(line)
+  local head = line:sub(1, 3)
+  if head == "+++" or head == "---" then
+    return { fg = theme.muted }
+  end
+  local first = line:sub(1, 1)
+  if first == "+" then
+    return { fg = theme.role("diff_added") }
+  elseif first == "-" then
+    return { fg = theme.role("diff_removed") }
+  elseif line:sub(1, 2) == "@@" then
+    return { fg = theme.accent, bold = true }
+  elseif line:sub(1, 4) == "diff" or line:sub(1, 5) == "index" then
+    return { fg = theme.muted }
+  end
+  return { fg = theme.text }
+end
+
+--- One editor pane PER SESSION, not one per plugin.
+---
+--- A program pane belongs to the plugin, not to whatever is selected — so a
+--- single `editor` pane would show session A's file while the tab strip over it
+--- named session B's. The name is ours to choose and the kernel stamps the owner,
+--- so keying it on the session is free and is the only version whose title is
+--- true.
+--- The separator is `_` because `validate_program_name` accepts letters, digits,
+--- `-` and `_` and nothing else: the name becomes a tmux window name, which tmux
+--- parses as part of a target string. A session id is a UUID, so `-` is already
+--- spoken for and `_` is the one character that cannot appear inside the id.
+local function editor_key(id)
+  return EDITOR_PROGRAM .. "_" .. id
+end
+
+--- Vim's `fnameescape()` set, because `:e` takes a command LINE and a path is
+--- whatever someone named a directory.
+---
+--- Written out rather than asked for: there is no round trip to nvim here, the
+--- keys just arrive. This is the set vim escapes with a backslash, minus the two
+--- control bytes in it (`\t` and `\n`) — typed, those are not characters a
+--- command line reads but keys it acts on, so they are handled below instead.
+local FNAME_SPECIAL = [[ *?[{`$\%#'"|!<]]
+
+--- A path as `:e` will read it, which is not a path as the filesystem holds one.
+---
+--- Escaping the obvious characters is not enough, and the gap is not cosmetic.
+--- Measured upstream on nvim 0.12.5 against the earlier version of this function,
+--- which escaped ` \t\\%#|"*?[`:
+---
+---   * `` r`date>PWNED-tick`.txt `` — the backtick expanded and the file was created;
+---   * `s<CR>:!date>PWNED-cr<CR>.txt` — the raw `\r` ENDED the command line and ran
+---     what followed as an Ex command.
+---
+--- So two halves. Every character in `FNAME_SPECIAL` gets a backslash, and every
+--- control byte gets a literal CTRL-V (`\22`) in front of it, which is how a
+--- command line takes a byte it would otherwise act on. Bytes above 127 are left
+--- alone: they are UTF-8 continuation bytes, and a backslash inside one would
+--- rename the file being opened.
+local function escape_for_edit(path)
+  local out = {}
+  for index = 1, #path do
+    local char = path:sub(index, index)
+    local byte = path:byte(index)
+    if byte < 32 or byte == 127 then
+      out[#out + 1] = "\22" .. char
+    elseif FNAME_SPECIAL:find(char, 1, true) then
+      out[#out + 1] = "\\" .. char
+    else
+      out[#out + 1] = char
+    end
+  end
+  local escaped = table.concat(out)
+  -- Special at the START of an `:edit` argument, where vim escapes them for the
+  -- same reason: `+cmd` is a command to run and `>>` is a redirection.
+  local first = escaped:sub(1, 1)
+  if first == "-" or first == "+" or first == ">" then
+    escaped = "\\" .. escaped
+  end
+  return escaped
+end
+
+--- The tab the editor was entered FROM, so leaving it goes back there.
+---
+--- Recorded rather than assumed: "back" from the editor is the agent for
+--- someone who opened a file while reading the agent, and the shell for someone
+--- who opened it while working in one. Sending both to the agent is the version
+--- that is wrong half the time, and silently.
+---
+--- It happens on `:q` as well as on the key. That took a kernel patch: measured
+--- 2026-09-10 with a control, `command.done` never fires for a `program` command,
+--- the snapshot carries no program state to poll, and tmux 3.2a has no
+--- `pane-died` hook to route round the outside. `program.exited` is the channel
+--- that was missing — addressed to the plugin that started the pane, so nobody
+--- else acts on an editor that is not theirs.
+local function previous_tab(id)
+  local tab = id and state["prev:" .. id]
+  if tab == SHELL_TAB and shell_enabled() then
+    return SHELL_TAB
+  end
+  return AGENT_TAB
+end
+
+--- Remember where we are, unless we are already in the editor — entering it
+--- twice must not record the editor as its own way out.
+local function remember_tab(id)
+  local tab = tab_of(id)
+  if tab ~= EDITOR_TAB then
+    state["prev:" .. id] = tab ~= AGENT_TAB and tab or nil
+  end
+end
+
+--- Just the last segment: the border has a tab strip on it already.
+local function basename(path)
+  return path:match("[^/]+$") or path
+end
+
 --- The surface a tab addresses: the session itself, or its `#shell` sibling.
 ---
 --- The same spelling the surface node carries and the kernel resolves, so
 --- anything keyed on it is keyed on the screen the user is actually reading.
 local function surface_of(id, tab)
   if not id then
+    return nil
+  end
+  if tab == DIFF_TAB then
+    -- Drawn from `run` output, not from a pty: there is no scrollback to name
+    -- and no keystrokes to forward. Its scrolling is this pane's own, below.
+    return nil
+  end
+  if tab == EDITOR_TAB then
+    -- A program surface, not a session one — so it has no session scrollback to
+    -- name, and every caller keyed on this (the page keys, the wheel, the
+    -- snap-to-bottom) correctly finds nothing to move. nvim owns its own screen.
     return nil
   end
   return tab == SHELL_TAB and (id .. "#shell") or id
@@ -161,6 +419,17 @@ end
 --- idea of what a page is. A wheel tick carries no such meaning, so it scrolls
 --- either tab -- see `on_scroll`.
 local function scroll_by(id, lines)
+  -- The diff tab scrolls TEXT, not a scrollback, so it answers the same keys
+  -- with its own offset. Written here and not in `render`, which is what lets
+  -- this pane stay `pure`.
+  if id and tab_of(id) == DIFF_TAB then
+    local path, staged, untracked = diff_of(id)
+    local body = path and diff_lines(id, path, staged, untracked) or nil
+    local at = (state["diffat:" .. id] or 0) - lines
+    local last = math.max(0, (body and #body or 0) - 1)
+    state["diffat:" .. id] = math.max(0, math.min(at, last))
+    return true
+  end
   if not id or tab_of(id) ~= AGENT_TAB then
     return false
   end
@@ -576,6 +845,27 @@ local function tab_specs(active)
       role = "action:" .. SELECT_SHELL,
     }
   end
+  -- Offered only once there is a file to show. Before that the tree is how you
+  -- open one (F3), and a chip leading to an empty pane would be the lit-up
+  -- affordance that does nothing.
+  if file_of(store.selected) then
+    specs[#specs + 1] = {
+      name = "Editor",
+      active = active == EDITOR_TAB,
+      shortcut = shortcut_for(EDITOR_OPEN),
+      role = "action:" .. SELECT_EDITOR,
+    }
+  end
+  -- Same rule as the editor's: offered once there is a diff to show, and never
+  -- as a lit chip leading to an empty pane. The changes list in the file column
+  -- is where one comes from.
+  if diff_of(store.selected) then
+    specs[#specs + 1] = {
+      name = "Diff",
+      active = active == DIFF_TAB,
+      role = "action:" .. SELECT_DIFF,
+    }
+  end
   return specs
 end
 
@@ -803,6 +1093,126 @@ local function centered(lines)
   return { type = "box", axis = "vertical", fill = 1, children = children }
 end
 
+--- The diff tab's body: `git diff` for one file, coloured and scrolled.
+---
+--- Its OWN scroll offset, not the surface scrollback every other tab uses,
+--- because there is no surface here — the lines are a `run`'s stdout. Sliced in
+--- `render` and never written from it: the offset moves in `on_action` and
+--- `on_scroll`, which is what keeps this pane `pure`.
+local function diff_body(session, width, height, level, border, strip, reserved_left)
+  local path, staged, untracked = diff_of(session.id)
+
+  local function say(lines)
+    local body = centered(lines)
+    body.frame = border_frame(
+      fit_right_title(" " .. (session.name or "") .. " (diff) ", width, reserved_left),
+      level,
+      border,
+      strip
+    )
+    return body
+  end
+
+  if not thurbox.granted.run then
+    return say({
+      { { text = "not trusted to read git", style = { fg = theme.bad, bold = true } } },
+      { { text = "F6 → ] → t grants it to this file", style = { fg = theme.muted } } },
+    })
+  end
+  if not path then
+    return say({ { { text = "no diff open", style = { fg = theme.muted } } } })
+  end
+
+  local lines = diff_lines(session.id, path, staged, untracked)
+  if not lines then
+    return say({ { { text = "reading the diff…", style = { fg = theme.muted } } } })
+  end
+  if #lines == 0 then
+    return say({
+      { { text = basename(path), style = { fg = theme.text, bold = true } } },
+      {
+        {
+          text = (untracked and "a new, empty file")
+            or (staged and "nothing staged for this file")
+            or "no unstaged changes",
+          style = { fg = theme.muted },
+        },
+      },
+    })
+  end
+
+  local rows = math.max(1, height - 2)
+  local at = math.max(0, math.min(state["diffat:" .. session.id] or 0, math.max(0, #lines - rows)))
+  local children = {}
+  for index = at + 1, math.min(#lines, at + rows) do
+    local line = lines[index]
+    children[#children + 1] = {
+      type = "text",
+      len = 1,
+      text = { { text = widgets.truncate(line, math.max(1, width - 2)), style = diff_style(line) } },
+    }
+  end
+  children[#children + 1] = { type = "text", fill = 1, text = "" }
+
+  local title = " " .. basename(path) .. (staged and " (staged)" or "") .. " (diff) "
+  return {
+    type = "box",
+    axis = "vertical",
+    fill = 1,
+    children = children,
+    frame = border_frame(fit_right_title(title, width, reserved_left), level, border, strip),
+  }
+end
+
+--- The editor tab's body: the program's cells under this pane's own border.
+---
+--- The frame is the SAME one the other two tabs get, strip and all, which is
+--- the whole point of the tab living here — the chips stay on screen while you
+--- are in the editor, so getting back to the agent is a click and not a
+--- rediscovery.
+local function editor_body(session, width, level, border, strip, reserved_left)
+  local path = file_of(session.id)
+
+  local function say(lines)
+    local body = centered(lines)
+    body.frame = border_frame(
+      fit_right_title(" " .. (session.name or "") .. " (editor) ", width, reserved_left),
+      level,
+      border,
+      strip
+    )
+    return body
+  end
+
+  if not thurbox.granted.program then
+    -- Honest rather than blank: the pane cannot grant itself the capability and
+    -- must not pretend it did.
+    return say({
+      { { text = "not trusted to run a program", style = { fg = theme.bad, bold = true } } },
+      { { text = "F6 → ] → t grants it to this file", style = { fg = theme.muted } } },
+    })
+  end
+  if not path then
+    return say({
+      { { text = "no file open", style = { fg = theme.muted } } },
+    })
+  end
+
+  return {
+    type = "surface",
+    program = editor_key(session.id),
+    -- A share of the remaining space, not a flag: `fill` is a NUMBER, and a
+    -- boolean here is the kind of key the kernel drops without a word.
+    fill = 1,
+    frame = border_frame(
+      fit_right_title(" " .. basename(path) .. " (editor) ", width, reserved_left),
+      level,
+      border,
+      strip
+    ),
+  }
+end
+
 -- --- selecting a tab -------------------------------------------------------
 
 --- Show a tab, bringing the pane forward with it.
@@ -811,12 +1221,90 @@ end
 --- chord works from wherever you were standing. The shell is opened on first
 --- use (v1 `show_shell_view`); `ensure_shell_pane` behind the command is
 --- idempotent, so asking again on every switch costs nothing.
-local function show_tab(id, tab)
+---
+--- `keep` leaves the focus where it was, which is what a CLICK in the file tree
+--- asks for: the pane's keys are plugin-scoped, so a click that opened a file
+--- and took the focus with it left the tree unable to answer its own arrow keys
+--- until you clicked back into it. A key press is the other case and keeps the
+--- old behaviour — your hand is already on the keyboard and the next thing you
+--- do is type into the file.
+local function show_tab(id, tab, keep)
   set_tab(id, tab)
   if tab == SHELL_TAB then
     command("shell", { session = id })
   end
-  command("focus", { text = NAME })
+  if not keep then
+    command("focus", { text = NAME })
+  end
+end
+
+--- Show `path` in this session's editor pane, starting one only if there is none.
+---
+--- ONE command, and the kernel decides which half of it applies: `keys` go to a
+--- pane that is running, `repo`/`args` start one that is not. That is not a
+--- convenience — the choice cannot be made here. Liveness is not in the snapshot,
+--- and keeping it in `state` is wrong across an interface reload, which re-runs
+--- this file but keeps the panes.
+---
+--- It replaces a close-then-open that was in this function for a day. The close
+--- was reasoned from a premise that turned out to be false — that a keyed name
+--- stays taken after the program in it exits — and `start_program` had been
+--- replacing an exited slot all along. What the close actually bought was a fresh
+--- nvim per file, which is the lag the tree made obvious.
+---
+--- The keys lead with CTRL-\ CTRL-N because we do not know what mode nvim is in:
+--- typed in insert mode, `:confirm e ...` would go into the file. Two Escapes did
+--- that job until a measurement upstream (nvim 0.12.5) found the mode they cannot
+--- leave: with a `:confirm` prompt already up — the one THIS command raises when
+--- the buffer is modified and `hidden` is off — the first Escape answers the
+--- prompt, the second is swallowed, and `nfirm e <path>` is typed into the buffer.
+--- CTRL-\ CTRL-N left every mode tried, prompt included.
+---
+--- `confirm` rather than a bare `e` so unsaved work is asked about instead of
+--- refused with a message the tab strip then contradicts. Note stock nvim ships
+--- `hidden` on, where `:confirm` never asks and the modified buffer is simply
+--- hidden — the question then comes back at `:q` as `E162`, which is nvim
+--- protecting the work rather than this call going wrong.
+local function ensure_editor(id, path, keep)
+  if type(path) ~= "string" or path == "" then
+    return
+  end
+  set_file(id, path)
+  remember_tab(id)
+  if not thurbox.granted.program then
+    command("message", {
+      text = "the central pane needs the program capability — F6 → ] → t",
+      level = "error",
+    })
+    -- Still switched to the tab: it draws the untrusted state, which is where
+    -- the instruction above is repeated for anyone who missed the message band.
+    show_tab(id, EDITOR_TAB, keep)
+    return
+  end
+  command("program", {
+    text = editor_key(id),
+    -- An ABSOLUTE path, built by the tree from the session's own `cwd`:
+    -- `thurbox.cmd.Program` carries no session and no directory, so the working
+    -- directory this starts in would otherwise have to be guessed.
+    repo = "nvim",
+    args = { path },
+    keys = "\28\14:confirm e " .. escape_for_edit(path) .. "\r",
+  })
+  show_tab(id, EDITOR_TAB, keep)
+end
+
+--- nvim quit: put the session back where it was standing before the editor.
+---
+--- The pane keeps its file, so the chip stays lit and the chord opens it again —
+--- a fresh nvim, this time, which is correct: there is nothing left to type at.
+local function editor_ended(name)
+  local id = type(name) == "string" and name:match("^" .. EDITOR_PROGRAM .. "_(.+)$")
+  if not id then
+    return
+  end
+  if tab_of(id) == EDITOR_TAB then
+    show_tab(id, previous_tab(id))
+  end
 end
 
 return {
@@ -853,6 +1341,17 @@ return {
       key = "f8",
       action = "shell.open",
       desc = "open a shell here",
+      scope = "global",
+      group = "UI",
+    },
+    -- F7, which is the key v1's review tab had on this same strip. An F-key and
+    -- not a letter chord for the reason the other two are: a focused terminal
+    -- keeps the bare `ctrl+<letter>` chords for the program inside it, and this
+    -- pane is a focused terminal nearly all the time.
+    {
+      key = "f7",
+      action = EDITOR_OPEN,
+      desc = "open the editor tab",
       scope = "global",
       group = "UI",
     },
@@ -899,6 +1398,14 @@ return {
     -- the whole reason the views share one plugin.
     local tab = tab_of(session.id)
     local strip, reserved_left = border_strip(width, border, tab)
+    -- Before the session surface below, because this tab shows a program rather
+    -- than a session and shares none of the scrollback arithmetic.
+    if tab == EDITOR_TAB then
+      return editor_body(session, width, level, border, strip, reserved_left)
+    end
+    if tab == DIFF_TAB then
+      return diff_body(session, width, height, level, border, strip, reserved_left)
+    end
     -- Both views are live terminals with a scrollback each, so the offset is
     -- the one this SURFACE is holding — which is also the one the kernel will
     -- set on the parser it draws.
@@ -956,7 +1463,74 @@ return {
     { action = FOCUS, desc = "focus the agent terminal" },
     { action = SELECT_AGENT, desc = "show the agent tab" },
     { action = SELECT_SHELL, desc = "show the shell tab" },
+    { action = SELECT_EDITOR, desc = "show the editor tab" },
+    { action = SELECT_DIFF, desc = "show the diff tab" },
   },
+
+  -- Running a program is the one thing this pane does that the user has to
+  -- agree to. `command` is present whether or not you may, so the grant is
+  -- checked before asking — see `ensure_editor`.
+  -- `program` runs the editor; `run` reads `git diff` for the diff tab. Two
+  -- separate grants because they are two separate decisions — one holds a
+  -- process open on your keystrokes, the other is a capped, timed-out read.
+  capabilities = { "program", "run" },
+
+  -- The file tree emits this; every other scalar on an `emit` table travels as
+  -- payload, which is how a path crosses from that column to this pane without
+  -- a `store` key both have to remember to clear.
+  -- The file tree emits this; every other scalar on an `emit` table travels as
+  -- payload, which is how a path crosses from that column to this pane without
+  -- a `store` key both have to remember to clear.
+  --
+  -- `command.done`/`command.failed` are deliberately NOT subscribed. They were,
+  -- as an experiment: the question was whether a `program` command reports done
+  -- when the request is accepted or when the process it started exits, since it
+  -- was the last channel that could have noticed `:q`. Measured 2026-09-10 with a
+  -- control — a message on `user.openfile`, which did appear — and neither
+  -- command event ever arrived. They say nothing about a program's lifetime.
+  -- `program.exited` does, and is delivered only to the plugin whose pane it is.
+  events = { "user.openfile", "user.opendiff", "program.exited" },
+
+  on_event = function(name, payload)
+    if name == "program.exited" then
+      editor_ended(payload and payload.name)
+      return
+    end
+    if name == "user.opendiff" then
+      local path = payload and payload.path
+      local id = payload and payload.session or store.selected
+      if type(path) ~= "string" or path == "" or not id then
+        return
+      end
+      set_diff(id, path, payload and payload.staged, payload and payload.untracked)
+      remember_tab(id)
+      show_tab(id, DIFF_TAB, payload and payload.keep == true)
+      return
+    end
+    if name ~= "user.openfile" then
+      return
+    end
+    local path = payload and payload.path
+    local id = payload and payload.session or store.selected
+    if type(path) ~= "string" or path == "" or not id then
+      return
+    end
+    -- The tree tells us what git says about this file, so the diff tab is aimed
+    -- at it in the BACKGROUND: no tab switch, just a chip that lights up and an
+    -- F7 that now has somewhere to go. Cleared when the file is unchanged, which
+    -- is the half that matters — a stale diff of the file you opened two files
+    -- ago is worse than no diff at all.
+    local diff = payload and payload.diff
+    if type(diff) == "string" and diff ~= "" then
+      set_diff(id, diff, payload.staged, payload.untracked)
+    else
+      set_diff(id, nil)
+    end
+    -- `keep` says the pointer asked, not a key. Only the sender knows which,
+    -- and the difference is the whole of this: a click must not carry the focus
+    -- out of the pane it was aimed at.
+    ensure_editor(id, path, payload and payload.keep == true)
+  end,
 
   -- A wheel tick, which is NOT the page keys above.
   --
@@ -972,6 +1546,12 @@ return {
   -- outer terminal means, and it is what a forwarded tick already delivers.
   on_scroll = function(wheel)
     local id = store.selected
+    -- The diff tab has no surface to scroll, so the wheel goes through the same
+    -- offset the page keys move — otherwise it would be inert over the one tab
+    -- whose content is longer than the pane by design.
+    if id and tab_of(id) == DIFF_TAB then
+      return scroll_by(id, wheel.up and 1 or -1)
+    end
     return scroll_surface(surface_of(id, tab_of(id)), wheel.up and 1 or -1)
   end,
 
@@ -1018,6 +1598,36 @@ return {
     if not id then
       return false
     end
+    if action == EDITOR_OPEN then
+      -- The chord FLIPS, where the chip selects outright — the same split the
+      -- shell has. With nothing open there is nothing to flip to, and the tree
+      -- is where a file comes from, so say that rather than showing an empty
+      -- tab.
+      if not file_of(id) then
+        command("message", {
+          text = "no file open — pick one in the file tree (F3)",
+          level = "info",
+        })
+        return true
+      end
+      -- Two views of ONE file, so the key that opens the file flips between
+      -- them: the code and what changed in it are the two things you look at
+      -- while editing, and they are asked for in alternation. With no diff for
+      -- this file the second stop does not exist and the key keeps its older
+      -- meaning — back where you came from.
+      if tab_of(id) ~= EDITOR_TAB then
+        -- Through the same door as a click in the tree: nvim may have quit while
+        -- the tab was hidden, and this is what starts it again. That covers the
+        -- way back from the diff as well as the way in from the agent.
+        ensure_editor(id, file_of(id))
+      elseif diff_of(id) then
+        remember_tab(id)
+        show_tab(id, DIFF_TAB)
+      else
+        show_tab(id, previous_tab(id))
+      end
+      return true
+    end
     if action == SELECT_AGENT then
       show_tab(id, AGENT_TAB)
     elseif action == SELECT_SHELL then
@@ -1025,6 +1635,17 @@ return {
         return true
       end
       show_tab(id, SHELL_TAB)
+    elseif action == SELECT_DIFF then
+      if not diff_of(id) then
+        return true
+      end
+      remember_tab(id)
+      show_tab(id, DIFF_TAB)
+    elseif action == SELECT_EDITOR then
+      if not file_of(id) then
+        return true
+      end
+      ensure_editor(id, file_of(id))
     else
       return false
     end
