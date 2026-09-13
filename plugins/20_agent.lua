@@ -260,51 +260,30 @@ local function editor_key(id)
   return EDITOR_PROGRAM .. "_" .. id
 end
 
---- Vim's `fnameescape()` set, because `:e` takes a command LINE and a path is
---- whatever someone named a directory.
+--- Where the editor listens, written as shell rather than as a path.
 ---
---- Written out rather than asked for: there is no round trip to nvim here, the
---- keys just arrive. This is the set vim escapes with a backslash, minus the two
---- control bytes in it (`\t` and `\n`) — typed, those are not characters a
---- command line reads but keys it acts on, so they are handled below instead.
-local FNAME_SPECIAL = [[ *?[{`$\%#'"|!<]]
+--- The plugin VM has no `os` and no `io`, so a private directory cannot be
+--- looked up from here — but both ends of this feature run through `sh`: `run`
+--- hands its string to `sh -c`, and the editor is started through one. So the
+--- directory is written once and expanded twice, identically, by the shell.
+---
+--- `$XDG_RUNTIME_DIR` because this socket is an RPC channel into the editor,
+--- which is arbitrary code as this user. Measured: `nvim --listen` creates it
+--- `srwxr-xr-x`, so in a shared `/tmp` any local account could drive the editor.
+--- The fallback therefore owns a `thurbox-$(id -u)` directory and takes 700 on
+--- it rather than writing the socket into `/tmp` directly.
+local SOCKET_DIR = 'D="${XDG_RUNTIME_DIR:-/tmp}/thurbox-$(id -u)"'
 
---- A path as `:e` will read it, which is not a path as the filesystem holds one.
+--- The socket for one session's editor, as a shell word.
 ---
---- Escaping the obvious characters is not enough, and the gap is not cosmetic.
---- Measured upstream on nvim 0.12.5 against the earlier version of this function,
---- which escaped ` \t\\%#|"*?[`:
----
----   * `` r`date>PWNED-tick`.txt `` — the backtick expanded and the file was created;
----   * `s<CR>:!date>PWNED-cr<CR>.txt` — the raw `\r` ENDED the command line and ran
----     what followed as an Ex command.
----
---- So two halves. Every character in `FNAME_SPECIAL` gets a backslash, and every
---- control byte gets a literal CTRL-V (`\22`) in front of it, which is how a
---- command line takes a byte it would otherwise act on. Bytes above 127 are left
---- alone: they are UTF-8 continuation bytes, and a backslash inside one would
---- rename the file being opened.
-local function escape_for_edit(path)
-  local out = {}
-  for index = 1, #path do
-    local char = path:sub(index, index)
-    local byte = path:byte(index)
-    if byte < 32 or byte == 127 then
-      out[#out + 1] = "\22" .. char
-    elseif FNAME_SPECIAL:find(char, 1, true) then
-      out[#out + 1] = "\\" .. char
-    else
-      out[#out + 1] = char
-    end
+--- A session id is a UUID, so nothing in it needs quoting — and an id that is
+--- not one is refused rather than escaped, because this string is interpolated
+--- into a command line the shell parses.
+local function editor_socket(id)
+  if type(id) ~= "string" or id == "" or id:find("[^%w%-]") then
+    return nil
   end
-  local escaped = table.concat(out)
-  -- Special at the START of an `:edit` argument, where vim escapes them for the
-  -- same reason: `+cmd` is a command to run and `>>` is a redirection.
-  local first = escaped:sub(1, 1)
-  if first == "-" or first == "+" or first == ">" then
-    escaped = "\\" .. escaped
-  end
-  return escaped
+  return '"$D/editor-' .. id .. '.sock"'
 end
 
 --- The tab the editor was entered FROM, so leaving it goes back there.
@@ -1252,28 +1231,50 @@ end
 --- replacing an exited slot all along. What the close actually bought was a fresh
 --- nvim per file, which is the lag the tree made obvious.
 ---
---- The keys lead with CTRL-\ CTRL-N because we do not know what mode nvim is in:
---- typed in insert mode, `:confirm e ...` would go into the file. Two Escapes did
---- that job until a measurement upstream (nvim 0.12.5) found the mode they cannot
---- leave: with a `:confirm` prompt already up — the one THIS command raises when
---- the buffer is modified and `hidden` is off — the first Escape answers the
---- prompt, the second is swallowed, and `nfirm e <path>` is typed into the buffer.
---- CTRL-\ CTRL-N left every mode tried, prompt included.
+--- Nothing is TYPED at the editor, and that is the whole point of the socket.
 ---
---- `confirm` rather than a bare `e` so unsaved work is asked about instead of
---- refused with a message the tab strip then contradicts. Note stock nvim ships
---- `hidden` on, where `:confirm` never asks and the modified buffer is simply
---- hidden — the question then comes back at `:q` as `E162`, which is nvim
---- protecting the work rather than this call going wrong.
+--- The first version sent `CTRL-\ CTRL-N` and then `:confirm e <path>` as keys.
+--- Keys reach nvim as keys, which means they go through the user's mappings, and
+--- a mode reset is exactly the sequence a config is likely to have taken apart.
+--- Measured 2026-09-14 against this machine's own config, outside thurbox: a
+--- single `<C-Bslash>` is mapped by vim-tmux-navigator, so it fires alone; the
+--- orphaned `<C-N>` then hits `map <C-n> :NERDTreeToggle<CR>` and NERDTree opens
+--- a vertical split AND takes focus — `getwininfo()` after the two bytes alone
+--- reads `[[1,'NERD_tree_tab_1',31],[2,'…/a.rs',88]]`. The `:confirm e` that
+--- followed loaded the file into NERDTree's window, which is the "a second file
+--- opens in a split" this replaced. With `nvim --clean` the same bytes are a
+--- no-op, so the pane was not wrong about nvim — it was wrong to type at it.
+---
+--- There is no unmappable mode reset to fall back to, so the editor is started
+--- with `--listen` and every later file is handed over with
+--- `--server … --remote-silent`, which is RPC: no mode, no mappings, and no
+--- `fnameescape` of our own to get wrong (the earlier one had already grown a
+--- backtick and a bare-CR hole).
+---
+--- Both commands are sent every time, and neither needs to know whether the
+--- editor is running: `start_program` is idempotent by contract ("asking for a
+--- pane that exists must be a map lookup and not a second copy"), so the
+--- `program` command starts nvim on the file the first time and does nothing
+--- after; the `run` opens the file over RPC when nvim is there and fails
+--- harmlessly when it is not — in which case the `program` command it raced has
+--- already opened that same path from `args`.
+---
+--- `--remote-silent` and not `:confirm`: stock nvim ships `hidden` on, where a
+--- modified buffer is hidden rather than refused and the question comes back at
+--- `:q` as `E162`. With `hidden` off nvim refuses and says so in its own message
+--- line, which is where a user is looking.
 local function ensure_editor(id, path, keep)
   if type(path) ~= "string" or path == "" then
     return
   end
   set_file(id, path)
   remember_tab(id)
-  if not (thurbox.granted or {}).program then
+  -- Both, because opening the FIRST file starts a program and every one after
+  -- it is an RPC call `run` makes. A grant covers the file rather than one
+  -- capability of it, so these are refused and granted together.
+  if not (thurbox.granted or {}).program or not run then
     command("message", {
-      text = "the central pane needs the program capability — F6 → ] → t",
+      text = "the central pane needs the program and run capabilities — F6 → ] → t",
       level = "error",
     })
     -- Still switched to the tab: it draws the untrusted state, which is where
@@ -1281,15 +1282,39 @@ local function ensure_editor(id, path, keep)
     show_tab(id, EDITOR_TAB, keep)
     return
   end
+  local socket = editor_socket(id)
+  if not socket then
+    command(
+      "message",
+      { text = "this session's id is not one this pane can open an editor for", level = "error" }
+    )
+    show_tab(id, EDITOR_TAB, keep)
+    return
+  end
   command("program", {
     text = editor_key(id),
-    -- An ABSOLUTE path, built by the tree from the session's own `cwd`:
-    -- `thurbox.cmd.Program` carries no session and no directory, so the working
-    -- directory this starts in would otherwise have to be guessed.
-    repo = "nvim",
-    args = { path },
-    keys = "\28\14:confirm e " .. escape_for_edit(path) .. "\r",
+    -- Started through `sh` so the socket directory is the shell's to expand and
+    -- to create; `exec` hands the pane straight to nvim, so what exits — and
+    -- what `program.exited` reports — is still the editor.
+    repo = "sh",
+    args = {
+      "-c",
+      SOCKET_DIR .. '; mkdir -p "$D" && chmod 700 "$D"; exec nvim --listen ' .. socket .. ' "$1"',
+      -- `$0` for the shell, then the file as `$1`: an ABSOLUTE path, built by
+      -- the tree from the session's own `cwd`, because `thurbox.cmd.Program`
+      -- carries no session and no directory of its own.
+      "thurbox-editor",
+      path,
+    },
   })
+  -- Keyed on the session and not on the file: this is a side effect, not an
+  -- answer anything reads back, and `refresh` is what makes a second click on
+  -- the same file open it again after the user wandered off in nvim.
+  run(
+    "editoropen:" .. id,
+    SOCKET_DIR .. "; exec nvim --server " .. socket .. " --remote-silent " .. shell_quote(path),
+    { session = id, refresh = true }
+  )
   show_tab(id, EDITOR_TAB, keep)
 end
 
