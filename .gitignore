@@ -1,0 +1,4 @@
+# Nothing generated belongs in a plugin working copy: a dirty tree makes
+# `thurbox-cli plugin update` report `kept` and refuse to move. Anything this
+# plugin produces goes to $XDG_CACHE_HOME/thurbox-files/ instead.
+*.log
