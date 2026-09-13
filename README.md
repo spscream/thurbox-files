@@ -4,6 +4,8 @@ A file column for [thurbox](https://github.com/Thurbeen/thurbox) v2, and the two
 tabs on the agent pane that make it useful: a file opens in an editor beside the
 agent, and a changed file opens its diff there.
 
+![The file column beside the agent: a tree, Enter opening a file in an editor tab, and a changed file opening its diff](media/demo.gif)
+
 | Pane | Slot | What it draws |
 |---|---|---|
 | `plugins/90_files.lua` | `files` | A tree of the selected session's working directory, plus a Changes tab listing what git reports. Enter on a file emits `user.openfile` |
@@ -104,6 +106,26 @@ cp .thurbox/thurbox.yml .          # what selene.toml's `std = "thurbox"` resolv
 selene plugins && stylua --check plugins
 ci/assemble-interface.sh .thurbox build/ui
 THURBOX_UI_DIR=$PWD/build/ui thurbox-cli plugin check
+```
+
+## The recording
+
+`demo/record.sh` makes the GIF above. `demo/sandbox.sh` builds a throwaway
+thurbox first — its own `HOME`, its own XDG roots, its own `TMUX_TMPDIR`, so it
+cannot reach a real interface, a real database or a real tmux server — installs
+these panes into it with the commands under [Install](#install), and leaves a
+small git repository for the tree to show.
+
+Every key in the GIF is a key: the recording runs inside tmux, which sends F3 and
+F6 the way a keyboard does, and the two capability grants are pressed in
+settings → Interface rather than written into `ui.json`. That is also why VHS is
+not used here — it drives a headless browser, which has no F-keys to send, and
+both doors into this feature are F-keys. `asciinema` records the pty and `agg`
+rasterises the cast.
+
+```bash
+demo/record.sh [media/demo.gif]   # needs asciinema, agg, tmux, git, sqlite3, nvim
+SNAP=/tmp/steps demo/record.sh    # plus what the screen held at each step
 ```
 
 ## Licence
