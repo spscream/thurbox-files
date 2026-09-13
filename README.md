@@ -68,7 +68,11 @@ rather than break without them.
   editor is started as `nvim --listen <socket>` and later files are handed to it
   with `nvim --server <socket> --remote-silent`, never typed at it). The socket
   lives in `$XDG_RUNTIME_DIR/thurbox-$(id -u)/`, which the pane creates `700` —
-  an RPC channel into an editor is arbitrary code as you.
+  an RPC channel into an editor is arbitrary code as you. Granted, the editor
+  starts when the file column is entered rather than when a file is picked, on
+  an empty buffer: a configured nvim took 1.8 s to come up here, and paying that
+  while the user is still reading the tree took the first file from 1.96 s to
+  0.82 s (median of three).
 
 A grant is keyed by the file's path, so installing these moves them out of
 `plugins/` and the grant is asked for again the first time each pane wants it.

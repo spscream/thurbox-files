@@ -503,6 +503,30 @@ local function diff_side(index, path)
   return nil
 end
 
+--- Tell the central pane a file is about to be picked, so the editor it starts
+--- is already up by the time one is.
+---
+--- Measured on this machine's own config: nvim takes ~1.8s to start (1766, 1911
+--- and 1766 ms over three runs, against 139 ms for `nvim --clean`), and until
+--- this event that cost was paid by the first Enter. Reaching the column is the
+--- earliest honest signal of intent — a key that focuses it or a press inside
+--- it — and it is early by seconds, not milliseconds.
+---
+--- Sent on every such moment rather than once: starting a program that is
+--- already running is a map lookup on the other side, so there is no state here
+--- to keep right. A pane that cannot start programs ignores it.
+---
+--- Carries the session and nothing else: WHERE that editor should stand is a
+--- question the pane that starts it answers, from the same snapshot this one
+--- would have read.
+local function warm_editor()
+  local session = selected_session()
+  if not session then
+    return
+  end
+  command("emit", { text = "editorwarm", session = session })
+end
+
 local function activate(session, item, clicked)
   if not item then
     return true
@@ -1241,6 +1265,7 @@ return {
   on_action = function(action)
     if action == "files.focus" then
       command("focus", { text = "files", toggle = true })
+      warm_editor()
       return true
     end
 
@@ -1398,6 +1423,7 @@ return {
     if not session or not hit.id then
       return false
     end
+    warm_editor()
     if tab_of() == CHANGES_TAB then
       local cursor = change_cursor(git_index(session))
       if not cursor:select_by_id(hit.id) then

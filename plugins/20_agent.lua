@@ -1231,6 +1231,89 @@ end
 --- replacing an exited slot all along. What the close actually bought was a fresh
 --- nvim per file, which is the lag the tree made obvious.
 ---
+--- A session's working directory, by id.
+---
+--- Not `selected()`: the editor is started for the session the event named, and
+--- a snapshot that has moved on is the one case where those two differ.
+local function session_cwd(id)
+  for _, session in ipairs(thurbox and thurbox.sessions or {}) do
+    if session.id == id then
+      return session.cwd
+    end
+  end
+  return nil
+end
+
+--- Start the editor for one session, with a file or with none.
+---
+--- Idempotent on the kernel's side — "asking for a pane that exists must be a
+--- map lookup and not a second copy" — so every caller can ask without knowing
+--- whether it is already running, and the first ask is the one that decides
+--- whether nvim starts on a file or on an empty buffer.
+--- What a warm editor opens while there is no file to open.
+---
+--- NOT nothing and NOT the session's directory, both measured against this
+--- machine's config: with no argument at all, `argc() == 0` is what a config
+--- tests on `VimEnter`, and this one opened a file tree in a split; with the
+--- directory, NERDTree takes the directory buffer over (it hijacks netrw by
+--- default) and then swallows the `:edit` that the first real file arrives as —
+--- 20 seconds later the file was still not on screen.
+---
+--- `/dev/null` is a file, so neither happens, and it reads as empty. The flags
+--- make it disappear the moment it is replaced: `bufhidden=wipe` drops the
+--- buffer when the window stops showing it, so what is left after the first
+--- file is one window and one listed buffer, measured.
+local WARM_FILE = "/dev/null"
+local WARM_FLAGS = ' -c "setlocal bufhidden=wipe nobuflisted"'
+
+local function start_editor(id, socket, open, cwd, warm)
+  command("program", {
+    text = editor_key(id),
+    -- Started through `sh` so the socket directory is the shell's to expand and
+    -- to create; `exec` hands the pane straight to nvim, so what exits — and
+    -- what `program.exited` reports — is still the editor. The `cd` is here for
+    -- the same reason: `thurbox.cmd.Program` carries no directory, so without it
+    -- the editor stands wherever thurbox does.
+    repo = "sh",
+    args = {
+      "-c",
+      SOCKET_DIR
+        .. '; mkdir -p "$D" && chmod 700 "$D"; '
+        .. (cwd and ("cd " .. shell_quote(cwd) .. " 2>/dev/null; ") or "")
+        .. "exec nvim --listen "
+        .. socket
+        .. (warm and WARM_FLAGS or "")
+        .. ' "$1"',
+      -- `$0` for the shell, then what to open as `$1` — a file when one was
+      -- picked, the session's directory when this is a warm start. ALWAYS one
+      -- argument: `argc()` is what a config tests to decide what an editor
+      -- opened with nothing should show, and here that meant a file tree in a
+      -- split.
+      "thurbox-editor",
+      open,
+    },
+  })
+end
+
+--- Start the editor before a file is picked, on the column's word that one is
+--- about to be.
+---
+--- Silent about capabilities, unlike `ensure_editor`: warming is something the
+--- user did not ask for by name, and a pane that is not trusted to run programs
+--- should say so when a file is actually opened, not when the tree is entered.
+local function warm_editor(id)
+  if not (thurbox.granted or {}).program then
+    return
+  end
+  -- No directory, no warm start: the editor would stand somewhere this pane
+  -- cannot name, and the first file it opened would be the moment that showed.
+  local cwd = session_cwd(id)
+  local socket = cwd and cwd ~= "" and editor_socket(id)
+  if socket then
+    start_editor(id, socket, WARM_FILE, cwd, true)
+  end
+end
+
 --- Nothing is TYPED at the editor, and that is the whole point of the socket.
 ---
 --- The first version sent `CTRL-\ CTRL-N` and then `:confirm e <path>` as keys.
@@ -1291,22 +1374,7 @@ local function ensure_editor(id, path, keep)
     show_tab(id, EDITOR_TAB, keep)
     return
   end
-  command("program", {
-    text = editor_key(id),
-    -- Started through `sh` so the socket directory is the shell's to expand and
-    -- to create; `exec` hands the pane straight to nvim, so what exits — and
-    -- what `program.exited` reports — is still the editor.
-    repo = "sh",
-    args = {
-      "-c",
-      SOCKET_DIR .. '; mkdir -p "$D" && chmod 700 "$D"; exec nvim --listen ' .. socket .. ' "$1"',
-      -- `$0` for the shell, then the file as `$1`: an ABSOLUTE path, built by
-      -- the tree from the session's own `cwd`, because `thurbox.cmd.Program`
-      -- carries no session and no directory of its own.
-      "thurbox-editor",
-      path,
-    },
-  })
+  start_editor(id, socket, path, session_cwd(id))
   -- Keyed on the session and not on the file: this is a side effect, not an
   -- answer anything reads back, and `refresh` is what makes a second click on
   -- the same file open it again after the user wandered off in nvim.
@@ -1514,7 +1582,7 @@ return {
   -- control — a message on `user.openfile`, which did appear — and neither
   -- command event ever arrived. They say nothing about a program's lifetime.
   -- `program.exited` does, and is delivered only to the plugin whose pane it is.
-  events = { "user.openfile", "user.opendiff", "program.exited" },
+  events = { "user.openfile", "user.opendiff", "user.editorwarm", "program.exited" },
 
   on_event = function(name, payload)
     if name == "program.exited" then
@@ -1530,6 +1598,13 @@ return {
       set_diff(id, path, payload and payload.staged, payload and payload.untracked)
       remember_tab(id)
       show_tab(id, DIFF_TAB, payload and payload.keep == true)
+      return
+    end
+    if name == "user.editorwarm" then
+      local id = payload and payload.session or store.selected
+      if id then
+        warm_editor(id)
+      end
       return
     end
     if name ~= "user.openfile" then
