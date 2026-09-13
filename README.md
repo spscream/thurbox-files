@@ -14,7 +14,7 @@ agent, and a changed file opens its diff there.
 |---|---|---|
 | `plugins/90_files.lua` | `files` | A tree of the selected session's working directory, plus a Changes tab listing what git reports. Enter on a file emits `user.openfile` |
 | `plugins/95_files_menu.lua` | `float` | The context menu a row opens |
-| `plugins/20_agent.lua` | `center` | A fork of thurbox's bundled agent pane: the same terminal, with an **editor** tab that runs your editor on the emitted file and a **diff** tab for one path |
+| `plugins/20_agent.lua` | `center` | A fork of thurbox's bundled agent pane: the same terminal, with an **editor** tab that runs nvim on the emitted file and a **diff** tab for one path |
 
 The three are one feature. The column emits, the agent pane consumes — installing
 the column alone gives you a tree whose Enter key does nothing.
@@ -64,7 +64,11 @@ rather than break without them.
 
 - `90_files.lua` — `run`, for the Changes tab. Untrusted, the tree still draws.
 - `20_agent.lua` — `program` (the editor is a program this pane starts) and
-  `run` (the diff it shows for one path).
+  `run` (the diff it shows for one path, and every file after the first: the
+  editor is started as `nvim --listen <socket>` and later files are handed to it
+  with `nvim --server <socket> --remote-silent`, never typed at it). The socket
+  lives in `$XDG_RUNTIME_DIR/thurbox-$(id -u)/`, which the pane creates `700` —
+  an RPC channel into an editor is arbitrary code as you.
 
 A grant is keyed by the file's path, so installing these moves them out of
 `plugins/` and the grant is asked for again the first time each pane wants it.
