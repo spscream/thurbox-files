@@ -286,6 +286,42 @@ local function editor_socket(id)
   return '"$D/editor-' .. id .. '.sock"'
 end
 
+--- The run that hands one file to the editor, keyed on the file as well as the
+--- session: `run` drops an ask whose key is still in flight, `refresh` or not,
+--- so a session-wide key let the hand-off still waiting for the first file
+--- swallow the click on the second.
+local function handoff_key(id, path)
+  return "editoropen:" .. id .. "\0" .. path
+end
+
+--- How long a hand-off waits for the editor, in tenths of a second. Well under
+--- `run`'s 30 s timeout, and well over the 1.8 s a configured nvim took to start.
+local HANDOFF_WAIT = 100
+
+--- Hand `path` to the editor, once the editor can take it.
+---
+--- The editor is warmed when the column is entered, so a quick click lands while
+--- it is still starting — and both halves of that are measured failures. Before
+--- nvim listens, `--remote-silent` is not a no-op: finding no server it edits
+--- the file in a nvim of its own, which with no terminal hangs until the run
+--- times out, and the editor on screen stays on `/dev/null`. After it listens
+--- but before startup is over, the file arrives in time for the warm
+--- `setlocal bufhidden=wipe nobuflisted` to land on it instead of on
+--- `/dev/null`. `v:vim_did_enter` is the moment both are behind us; a server
+--- that never gets there is an error the pane shows, not a silent `/dev/null`.
+local function editor_handoff(socket, path)
+  return SOCKET_DIR
+    .. '; i=0; until [ "$(nvim --server '
+    .. socket
+    .. ' --remote-expr v:vim_did_enter 2>/dev/null)" = 1 ]; do i=$((i + 1)); if [ "$i" -ge '
+    .. HANDOFF_WAIT
+    .. " ]; then echo 'the editor never answered on its socket' >&2; exit 1; fi; sleep 0.1; done; "
+    .. "exec nvim --server "
+    .. socket
+    .. " --remote-silent "
+    .. shell_quote(path)
+end
+
 --- The tab the editor was entered FROM, so leaving it goes back there.
 ---
 --- Recorded rather than assumed: "back" from the editor is the agent for
@@ -1176,6 +1212,19 @@ local function editor_body(session, width, level, border, strip, reserved_left)
       { { text = "no file open", style = { fg = theme.muted } } },
     })
   end
+  -- A hand-off that never reached the editor says so. The surface would show
+  -- the buffer the editor was warmed with, which reads as the file being empty.
+  local handoff = (thurbox.runs or {})[handoff_key(session.id, path)]
+  if handoff and handoff.state == "done" and not handoff.ok then
+    local why = handoff.timed_out and "the hand-off timed out"
+      or (handoff.stderr or ""):match("[^\n]+")
+      or "the hand-off failed"
+    return say({
+      { { text = "could not open " .. basename(path), style = { fg = theme.bad, bold = true } } },
+      { { text = why, style = { fg = theme.muted } } },
+      { { text = "pick it again in the tree to retry", style = { fg = theme.muted } } },
+    })
+  end
 
   return {
     type = "surface",
@@ -1338,9 +1387,9 @@ end
 --- editor is running: `start_program` is idempotent by contract ("asking for a
 --- pane that exists must be a map lookup and not a second copy"), so the
 --- `program` command starts nvim on the file the first time and does nothing
---- after; the `run` opens the file over RPC when nvim is there and fails
---- harmlessly when it is not — in which case the `program` command it raced has
---- already opened that same path from `args`.
+--- after; the `run` waits for nvim to finish starting and then opens the file
+--- over RPC — when the `program` command started nvim on that same path, the
+--- open is a no-op. See `editor_handoff` for why it waits.
 ---
 --- `--remote-silent` and not `:confirm`: stock nvim ships `hidden` on, where a
 --- modified buffer is hidden rather than refused and the question comes back at
@@ -1375,14 +1424,9 @@ local function ensure_editor(id, path, keep)
     return
   end
   start_editor(id, socket, path, session_cwd(id))
-  -- Keyed on the session and not on the file: this is a side effect, not an
-  -- answer anything reads back, and `refresh` is what makes a second click on
-  -- the same file open it again after the user wandered off in nvim.
-  run(
-    "editoropen:" .. id,
-    SOCKET_DIR .. "; exec nvim --server " .. socket .. " --remote-silent " .. shell_quote(path),
-    { session = id, refresh = true }
-  )
+  -- `refresh` is what makes a second click on the same file open it again after
+  -- the user wandered off in nvim.
+  run(handoff_key(id, path), editor_handoff(socket, path), { session = id, refresh = true })
   show_tab(id, EDITOR_TAB, keep)
 end
 
