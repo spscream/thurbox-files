@@ -18,7 +18,7 @@ on:
 # README: its version badge and its `git clone --branch` recipe say this number
 # out loud, and nothing here fails if they drift.
 env:
-  THURBOX_TAG: v2.22.4
+  THURBOX_TAG: v2.23.3
 
 jobs:
   lint:

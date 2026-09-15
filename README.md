@@ -1,7 +1,7 @@
 # thurbox-files
 
 [![CI](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml/badge.svg)](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml)
-[![thurbox v2.22.4](https://img.shields.io/badge/thurbox-v2.22.4-2aa198)](https://github.com/Thurbeen/thurbox/releases/tag/v2.22.4)
+[![thurbox v2.23.3](https://img.shields.io/badge/thurbox-v2.23.3-2aa198)](https://github.com/Thurbeen/thurbox/releases/tag/v2.23.3)
 [![licence MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
 
 A file column for [thurbox](https://github.com/Thurbeen/thurbox) v2, and the two
@@ -113,7 +113,7 @@ Both run against the release named by `THURBOX_TAG` in the workflow — the bina
 and the `ui/` tree it loads have to be the same version. Locally:
 
 ```bash
-git clone --depth 1 --branch v2.22.4 https://github.com/Thurbeen/thurbox .thurbox
+git clone --depth 1 --branch v2.23.3 https://github.com/Thurbeen/thurbox .thurbox
 cp .thurbox/thurbox.yml .          # what selene.toml's `std = "thurbox"` resolves to
 selene plugins && stylua --check plugins
 ci/assemble-interface.sh .thurbox build/ui
