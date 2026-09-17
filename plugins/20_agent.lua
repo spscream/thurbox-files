@@ -1437,17 +1437,12 @@ return {
       scope = "global",
       group = "UI",
     },
-    -- F7, which is the key v1's review tab had on this same strip. An F-key and
-    -- not a letter chord for the reason the other two are: a focused terminal
-    -- keeps the bare `ctrl+<letter>` chords for the program inside it, and this
-    -- pane is a focused terminal nearly all the time.
-    {
-      key = "f7",
-      action = EDITOR_OPEN,
-      desc = "open the editor tab",
-      scope = "global",
-      group = "UI",
-    },
+    -- No F7 here any more. It was the key v1's review tab had on this strip, and
+    -- a review pane installed beside this one claims it too — with both
+    -- declared, one silently shadows the other and the action band advertises a
+    -- chord that does nothing. The editor tab is reached the way it is actually
+    -- opened: picking a file in the files pane, the tab chip on this pane's own
+    -- border, or `select the editor tab` in the palette.
     -- Pane-scoped: the page keys belong to whoever is focused, and on the shell
     -- tab the action declines them so the pty keeps them (a pager has its own
     -- idea of what a page is).
