@@ -291,21 +291,29 @@ end
 --- `refresh` or not, so a key two picks shared swallowed the second. A ring
 --- because `run` keeps an answer for as long as the interface runs, so a key per
 --- path or per pick would grow for that long; this is eight per session.
+---
+--- Eight is not a limit on picks in flight in practice: a hand-off that a later
+--- pick has replaced leaves on its next probe (see `editor_handoff`).
 local HANDOFF_SLOTS = 8
 
 --- Take the key for a new pick, and remember it as the one the tab reports on.
+---
+--- Also returns the pick's number, which the hand-off prints: the ring reuses
+--- keys, and `run` keeps a key's last answer readable until the next one lands,
+--- so an answer is only about THIS pick when it says so.
 local function next_handoff(id)
-  local slot = (state["pick:" .. id] or 0) % HANDOFF_SLOTS + 1
-  state["pick:" .. id] = slot
-  state["handoff:" .. id] = "editoropen:" .. id .. ":" .. slot
-  return state["handoff:" .. id]
+  local pick = (state["pick:" .. id] or 0) + 1
+  state["pick:" .. id] = pick
+  state["handoff:" .. id] = "editoropen:" .. id .. ":" .. ((pick - 1) % HANDOFF_SLOTS + 1)
+  return state["handoff:" .. id], pick
 end
 
 --- How long a hand-off waits for the editor, in seconds, counted on the clock
 --- and not in probes: a stopped editor accepts the connection and never replies,
 --- so a probe nothing bounds never comes back to be counted. `timeout` bounds
 --- each probe where it exists (coreutils, not stock macOS); where it does not,
---- `run`'s own 30 s timeout is the bound.
+--- `run`'s own 30 s timeout is the bound — per hand-off, and `run` has four
+--- slots for every plugin together, so four such hand-offs fill the pool.
 local HANDOFF_WAIT = 10
 
 --- Hand `path` to the editor, once the editor can take it.
@@ -321,29 +329,36 @@ local HANDOFF_WAIT = 10
 ---
 --- Only the LATEST pick opens. Every hand-off writes its pid to the session's
 --- `.pick` file as it starts — making the directory itself, since it can start
---- before the editor's own `mkdir` — and one that finds another pid there once
---- the editor is up steps aside: picks made before the socket binds are all released
+--- before the editor's own `mkdir` — and one that finds another pid there
+--- steps aside, checked on every probe so a replaced hand-off does not hold a
+--- run slot until the editor is up. A `.pick` that cannot be read is an error,
+--- not a quiet step aside: picks made before the socket binds are all released
 --- by the same edge, and without this whichever got there first won.
 ---
 --- An editor that answers but is still starting at the deadline gets the file
 --- anyway — it is alive, so `--remote-silent` cannot fall back to a nvim of its
 --- own, and on a cold start it already holds the file from `args`. Only an
 --- editor that never answered is an error.
-local function editor_handoff(id, path)
+local function editor_handoff(id, path, pick)
   local socket = editor_socket(id)
   return SOCKET_DIR
+    .. "; echo 'pick "
+    .. pick
+    .. "' >&2"
     .. '; P="$D/editor-'
     .. id
     .. '.pick"; mkdir -p "$D" && chmod 700 "$D"; printf %s "$$" >"$P.$$" && mv -f "$P.$$" "$P"; '
+    .. 'latest() { m=$(cat "$P" 2>/dev/null) || { echo "the hand-off lost track of the latest pick" >&2; exit 1; }; '
+    .. '[ "$m" = "$$" ] || exit 0; }; '
     .. "T=; command -v timeout >/dev/null 2>&1 && T='timeout 2'; start=$(date +%s); up=; "
-    .. "while :; do got=$($T nvim --server "
+    .. "while :; do latest; got=$($T nvim --server "
     .. socket
     .. ' --remote-expr v:vim_did_enter 2>/dev/null); [ "$got" = 1 ] && break; [ "$got" = 0 ] && up=1; '
     .. "if [ $(($(date +%s) - start)) -ge "
     .. HANDOFF_WAIT
     .. ' ]; then [ -n "$up" ] && break; '
     .. "echo 'the editor never answered on its socket' >&2; exit 1; fi; sleep 0.1; done; "
-    .. '[ "$(cat "$P")" = "$$" ] || exit 0; '
+    .. "latest; "
     .. "exec nvim --server "
     .. socket
     .. " --remote-silent "
@@ -1209,6 +1224,33 @@ local function diff_body(session, width, height, level, border, strip, reserved_
   }
 end
 
+--- Why the latest hand-off did not reach the editor, or nil when it did or is
+--- still going.
+---
+--- `failed` is a run the kernel could not start at all, which carries `error`
+--- and no stderr. A `done` answer counts only when it names the latest pick —
+--- see `next_handoff` — so a reused key's old failure is not painted over a
+--- file that opened.
+local function handoff_failure(id)
+  local answer = (thurbox.runs or {})[state["handoff:" .. id] or ""]
+  if not answer then
+    return nil
+  end
+  if answer.state == "failed" then
+    return answer.error or "the hand-off could not start"
+  end
+  if answer.state ~= "done" or answer.ok then
+    return nil
+  end
+  local err = answer.stderr or ""
+  if tonumber(err:match("^pick (%d+)")) ~= state["pick:" .. id] then
+    return nil
+  end
+  return answer.timed_out and "the hand-off timed out"
+    or err:match("\n([^\n]+)")
+    or "the hand-off failed"
+end
+
 --- The editor tab's body: the program's cells under this pane's own border.
 ---
 --- The frame is the SAME one the other two tabs get, strip and all, which is
@@ -1245,16 +1287,17 @@ local function editor_body(session, width, level, border, strip, reserved_left)
   -- A hand-off that never reached the editor says so on the border, OVER the
   -- surface and not instead of it: `program` may have opened this same path
   -- from `args`, and a page saying the file could not be opened would then
-  -- stand where the file is. A new pick is a new key, so it clears at once.
-  local handoff = (thurbox.runs or {})[state["handoff:" .. session.id] or ""]
+  -- stand where the file is.
   local title = " " .. basename(path) .. " (editor) "
   local warn = nil
-  if handoff and handoff.state == "done" and not handoff.ok then
-    local why = handoff.timed_out and "the hand-off timed out"
-      or (handoff.stderr or ""):match("[^\n]+")
-      or "the hand-off failed"
-    title = title .. "· " .. why .. " "
-    warn = { fg = theme.bad, bold = true }
+  local why = handoff_failure(session.id)
+  if why then
+    -- The warning LEADS: the title is cut from the right to fit beside the tab
+    -- strip, so a reason put after the name was the first thing to go.
+    title = " not opened: " .. basename(path) .. " · " .. why .. " "
+    -- It replaces the focus badge, so it keeps the badge's two looks.
+    warn = level == "focused" and { fg = theme.role("inverted_fg"), bg = theme.bad, bold = true }
+      or { fg = theme.bad, bold = true }
   end
 
   return {
@@ -1345,8 +1388,16 @@ end
 --- make it disappear the moment it is replaced: `bufhidden=wipe` drops the
 --- buffer when the window stops showing it, so what is left after the first
 --- file is one window and one listed buffer, measured.
+---
+--- They are set on the `/dev/null` buffer BY NUMBER, not with `setlocal`: `-c`
+--- runs when startup ends, and a file handed over while a slow config was
+--- still loading is the current buffer by then — `setlocal` marked THAT file
+--- unlisted. A `/dev/null` already out of every window is deleted outright,
+--- since `bufhidden` only acts when a buffer is next hidden.
 local WARM_FILE = "/dev/null"
-local WARM_FLAGS = ' -c "setlocal bufhidden=wipe nobuflisted"'
+local WARM_FLAGS = " -c \"lua local b = vim.fn.bufnr('/dev/null') "
+  .. "if b > 0 then vim.bo[b].buflisted = false vim.bo[b].bufhidden = 'wipe' "
+  .. 'if vim.fn.bufwinnr(b) < 0 then vim.api.nvim_buf_delete(b, { force = true }) end end"'
 
 local function start_editor(id, socket, open, cwd, warm)
   command("program", {
@@ -1459,7 +1510,8 @@ local function ensure_editor(id, path, keep)
   start_editor(id, socket, path, session_cwd(id))
   -- `refresh` is what makes a second click on the same file open it again after
   -- the user wandered off in nvim.
-  run(next_handoff(id), editor_handoff(id, path), { session = id, refresh = true })
+  local key, pick = next_handoff(id)
+  run(key, editor_handoff(id, path, pick), { session = id, refresh = true })
   show_tab(id, EDITOR_TAB, keep)
 end
 
