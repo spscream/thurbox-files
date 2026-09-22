@@ -286,17 +286,27 @@ local function editor_socket(id)
   return '"$D/editor-' .. id .. '.sock"'
 end
 
---- The run that hands one file to the editor, keyed on the file as well as the
---- session: `run` drops an ask whose key is still in flight, `refresh` or not,
---- so a session-wide key let the hand-off still waiting for the first file
---- swallow the click on the second.
-local function handoff_key(id, path)
-  return "editoropen:" .. id .. "\0" .. path
+--- The runs that hand files to one session's editor: one key per pick, from a
+--- small ring. Per pick because `run` drops an ask whose key is still in flight,
+--- `refresh` or not, so a key two picks shared swallowed the second. A ring
+--- because `run` keeps an answer for as long as the interface runs, so a key per
+--- path or per pick would grow for that long; this is eight per session.
+local HANDOFF_SLOTS = 8
+
+--- Take the key for a new pick, and remember it as the one the tab reports on.
+local function next_handoff(id)
+  local slot = (state["pick:" .. id] or 0) % HANDOFF_SLOTS + 1
+  state["pick:" .. id] = slot
+  state["handoff:" .. id] = "editoropen:" .. id .. ":" .. slot
+  return state["handoff:" .. id]
 end
 
---- How long a hand-off waits for the editor, in tenths of a second. Well under
---- `run`'s 30 s timeout, and well over the 1.8 s a configured nvim took to start.
-local HANDOFF_WAIT = 100
+--- How long a hand-off waits for the editor, in seconds, counted on the clock
+--- and not in probes: a stopped editor accepts the connection and never replies,
+--- so a probe nothing bounds never comes back to be counted. `timeout` bounds
+--- each probe where it exists (coreutils, not stock macOS); where it does not,
+--- `run`'s own 30 s timeout is the bound.
+local HANDOFF_WAIT = 10
 
 --- Hand `path` to the editor, once the editor can take it.
 ---
@@ -307,15 +317,33 @@ local HANDOFF_WAIT = 100
 --- times out, and the editor on screen stays on `/dev/null`. After it listens
 --- but before startup is over, the file arrives in time for the warm
 --- `setlocal bufhidden=wipe nobuflisted` to land on it instead of on
---- `/dev/null`. `v:vim_did_enter` is the moment both are behind us; a server
---- that never gets there is an error the pane shows, not a silent `/dev/null`.
-local function editor_handoff(socket, path)
+--- `/dev/null`. `v:vim_did_enter` is the moment both are behind us.
+---
+--- Only the LATEST pick opens. Every hand-off writes its pid to the session's
+--- `.pick` file as it starts — making the directory itself, since it can start
+--- before the editor's own `mkdir` — and one that finds another pid there once
+--- the editor is up steps aside: picks made before the socket binds are all released
+--- by the same edge, and without this whichever got there first won.
+---
+--- An editor that answers but is still starting at the deadline gets the file
+--- anyway — it is alive, so `--remote-silent` cannot fall back to a nvim of its
+--- own, and on a cold start it already holds the file from `args`. Only an
+--- editor that never answered is an error.
+local function editor_handoff(id, path)
+  local socket = editor_socket(id)
   return SOCKET_DIR
-    .. '; i=0; until [ "$(nvim --server '
+    .. '; P="$D/editor-'
+    .. id
+    .. '.pick"; mkdir -p "$D" && chmod 700 "$D"; printf %s "$$" >"$P.$$" && mv -f "$P.$$" "$P"; '
+    .. "T=; command -v timeout >/dev/null 2>&1 && T='timeout 2'; start=$(date +%s); up=; "
+    .. "while :; do got=$($T nvim --server "
     .. socket
-    .. ' --remote-expr v:vim_did_enter 2>/dev/null)" = 1 ]; do i=$((i + 1)); if [ "$i" -ge '
+    .. ' --remote-expr v:vim_did_enter 2>/dev/null); [ "$got" = 1 ] && break; [ "$got" = 0 ] && up=1; '
+    .. "if [ $(($(date +%s) - start)) -ge "
     .. HANDOFF_WAIT
-    .. " ]; then echo 'the editor never answered on its socket' >&2; exit 1; fi; sleep 0.1; done; "
+    .. ' ]; then [ -n "$up" ] && break; '
+    .. "echo 'the editor never answered on its socket' >&2; exit 1; fi; sleep 0.1; done; "
+    .. '[ "$(cat "$P")" = "$$" ] || exit 0; '
     .. "exec nvim --server "
     .. socket
     .. " --remote-silent "
@@ -1019,9 +1047,11 @@ end
 ---
 --- All three are border cells, which is the point — the surface underneath
 --- keeps the full inner rect, exactly as v1 insets the terminal vertically only.
-local function border_frame(title, level, border, strip, bar)
+---
+--- `title_style` overrides the focus colour, for a title that is a warning.
+local function border_frame(title, level, border, strip, bar, title_style)
   return {
-    title = { { text = title, style = chrome.title_style(level) } },
+    title = { { text = title, style = title_style or chrome.title_style(level) } },
     title_align = "right",
     border_style = border,
     overlay = { top_left = strip, right_column = bar },
@@ -1212,18 +1242,19 @@ local function editor_body(session, width, level, border, strip, reserved_left)
       { { text = "no file open", style = { fg = theme.muted } } },
     })
   end
-  -- A hand-off that never reached the editor says so. The surface would show
-  -- the buffer the editor was warmed with, which reads as the file being empty.
-  local handoff = (thurbox.runs or {})[handoff_key(session.id, path)]
+  -- A hand-off that never reached the editor says so on the border, OVER the
+  -- surface and not instead of it: `program` may have opened this same path
+  -- from `args`, and a page saying the file could not be opened would then
+  -- stand where the file is. A new pick is a new key, so it clears at once.
+  local handoff = (thurbox.runs or {})[state["handoff:" .. session.id] or ""]
+  local title = " " .. basename(path) .. " (editor) "
+  local warn = nil
   if handoff and handoff.state == "done" and not handoff.ok then
     local why = handoff.timed_out and "the hand-off timed out"
       or (handoff.stderr or ""):match("[^\n]+")
       or "the hand-off failed"
-    return say({
-      { { text = "could not open " .. basename(path), style = { fg = theme.bad, bold = true } } },
-      { { text = why, style = { fg = theme.muted } } },
-      { { text = "pick it again in the tree to retry", style = { fg = theme.muted } } },
-    })
+    title = title .. "· " .. why .. " "
+    warn = { fg = theme.bad, bold = true }
   end
 
   return {
@@ -1233,10 +1264,12 @@ local function editor_body(session, width, level, border, strip, reserved_left)
     -- boolean here is the kind of key the kernel drops without a word.
     fill = 1,
     frame = border_frame(
-      fit_right_title(" " .. basename(path) .. " (editor) ", width, reserved_left),
+      fit_right_title(title, width, reserved_left),
       level,
       border,
-      strip
+      strip,
+      nil,
+      warn
     ),
   }
 end
@@ -1426,7 +1459,7 @@ local function ensure_editor(id, path, keep)
   start_editor(id, socket, path, session_cwd(id))
   -- `refresh` is what makes a second click on the same file open it again after
   -- the user wandered off in nvim.
-  run(handoff_key(id, path), editor_handoff(socket, path), { session = id, refresh = true })
+  run(next_handoff(id), editor_handoff(id, path), { session = id, refresh = true })
   show_tab(id, EDITOR_TAB, keep)
 end
 
