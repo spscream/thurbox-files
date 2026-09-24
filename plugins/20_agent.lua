@@ -286,6 +286,85 @@ local function editor_socket(id)
   return '"$D/editor-' .. id .. '.sock"'
 end
 
+--- The runs that hand files to one session's editor: one key per pick, from a
+--- small ring. Per pick because `run` drops an ask whose key is still in flight,
+--- `refresh` or not, so a key two picks shared swallowed the second. A ring
+--- because `run` keeps an answer for as long as the interface runs, so a key per
+--- path or per pick would grow for that long; this is eight per session.
+---
+--- Eight is not a limit on picks in flight in practice: a hand-off that a later
+--- pick has replaced leaves on its next probe (see `editor_handoff`).
+local HANDOFF_SLOTS = 8
+
+--- Take the key for a new pick, and remember it as the one the tab reports on.
+---
+--- Also returns the pick's number, which the hand-off prints: the ring reuses
+--- keys, and `run` keeps a key's last answer readable until the next one lands,
+--- so an answer is only about THIS pick when it says so.
+local function next_handoff(id)
+  local pick = (state["pick:" .. id] or 0) + 1
+  state["pick:" .. id] = pick
+  state["handoff:" .. id] = "editoropen:" .. id .. ":" .. ((pick - 1) % HANDOFF_SLOTS + 1)
+  return state["handoff:" .. id], pick
+end
+
+--- How long a hand-off waits for the editor, in seconds, counted on the clock
+--- and not in probes: a stopped editor accepts the connection and never replies,
+--- so a probe nothing bounds never comes back to be counted. `timeout` bounds
+--- each probe where it exists (coreutils, not stock macOS); where it does not,
+--- `run`'s own 30 s timeout is the bound — per hand-off, and `run` has four
+--- slots for every plugin together, so four such hand-offs fill the pool.
+local HANDOFF_WAIT = 10
+
+--- Hand `path` to the editor, once the editor can take it.
+---
+--- The editor is warmed when the column is entered, so a quick click lands while
+--- it is still starting — and both halves of that are measured failures. Before
+--- nvim listens, `--remote-silent` is not a no-op: finding no server it edits
+--- the file in a nvim of its own, which with no terminal hangs until the run
+--- times out, and the editor on screen stays on `/dev/null`. After it listens
+--- but before startup is over, the file arrives in time for the warm
+--- `setlocal bufhidden=wipe nobuflisted` to land on it instead of on
+--- `/dev/null`. `v:vim_did_enter` is the moment both are behind us.
+---
+--- Only the LATEST pick opens. Every hand-off writes its pid to the session's
+--- `.pick` file as it starts — making the directory itself, since it can start
+--- before the editor's own `mkdir` — and one that finds another pid there
+--- steps aside, checked on every probe so a replaced hand-off does not hold a
+--- run slot until the editor is up. A `.pick` that cannot be read is an error,
+--- not a quiet step aside: picks made before the socket binds are all released
+--- by the same edge, and without this whichever got there first won.
+---
+--- An editor that answers but is still starting at the deadline gets the file
+--- anyway — it is alive, so `--remote-silent` cannot fall back to a nvim of its
+--- own, and on a cold start it already holds the file from `args`. Only an
+--- editor that never answered is an error.
+local function editor_handoff(id, path, pick)
+  local socket = editor_socket(id)
+  return SOCKET_DIR
+    .. "; echo 'pick "
+    .. pick
+    .. "' >&2"
+    .. '; P="$D/editor-'
+    .. id
+    .. '.pick"; mkdir -p "$D" && chmod 700 "$D"; printf %s "$$" >"$P.$$" && mv -f "$P.$$" "$P"; '
+    .. 'latest() { m=$(cat "$P" 2>/dev/null) || { echo "the hand-off lost track of the latest pick" >&2; exit 1; }; '
+    .. '[ "$m" = "$$" ] || exit 0; }; '
+    .. "T=; command -v timeout >/dev/null 2>&1 && T='timeout 2'; start=$(date +%s); up=; "
+    .. "while :; do latest; got=$($T nvim --server "
+    .. socket
+    .. ' --remote-expr v:vim_did_enter 2>/dev/null); [ "$got" = 1 ] && break; [ "$got" = 0 ] && up=1; '
+    .. "if [ $(($(date +%s) - start)) -ge "
+    .. HANDOFF_WAIT
+    .. ' ]; then [ -n "$up" ] && break; '
+    .. "echo 'the editor never answered on its socket' >&2; exit 1; fi; sleep 0.1; done; "
+    .. "latest; "
+    .. "exec nvim --server "
+    .. socket
+    .. " --remote-silent "
+    .. shell_quote(path)
+end
+
 --- The tab the editor was entered FROM, so leaving it goes back there.
 ---
 --- Recorded rather than assumed: "back" from the editor is the agent for
@@ -983,9 +1062,11 @@ end
 ---
 --- All three are border cells, which is the point — the surface underneath
 --- keeps the full inner rect, exactly as v1 insets the terminal vertically only.
-local function border_frame(title, level, border, strip, bar)
+---
+--- `title_style` overrides the focus colour, for a title that is a warning.
+local function border_frame(title, level, border, strip, bar, title_style)
   return {
-    title = { { text = title, style = chrome.title_style(level) } },
+    title = { { text = title, style = title_style or chrome.title_style(level) } },
     title_align = "right",
     border_style = border,
     overlay = { top_left = strip, right_column = bar },
@@ -1143,6 +1224,75 @@ local function diff_body(session, width, height, level, border, strip, reserved_
   }
 end
 
+--- Why the latest hand-off did not reach the editor, or nil when it did or is
+--- still going.
+---
+--- `failed` is a run the kernel could not start at all, which carries `error`
+--- and no stderr. A `done` answer names its own pick — the hand-off's first
+--- command prints it — so a reused key's old failure is not painted over a file
+--- that opened.
+---
+--- Nothing names a pick on a `failed` answer, and nothing can: it is written on
+--- a worker thread like any other, so it arrives whenever it arrives, and the
+--- ring hands the ninth pick the first one's slot. It is drawn anyway, and that
+--- is a decision rather than an oversight. The wrong it can do is bounded by
+--- the run in flight replacing it, and that bound has three sizes. Against an
+--- editor that has already entered it is 19-21 ms, measured over ten runs.
+--- Against one that is still starting it is that start: the wait wakes about
+--- every hundred milliseconds, and a config of any size takes several of those
+--- — this is the case the wait exists for, the file does open at the end of it,
+--- and the warning standing over it until then is simply false. Against one
+--- that never answers it is the ten-second deadline, and there it is not false
+--- but out of date, because that pick is failing as well. The two ways of
+--- guessing at it from here are bounded by nothing. Suppressing what
+--- cannot be attributed silences a cause that fails every pick, for good, after
+--- the ring's first lap. Choosing a slot the answer can be attributed in moves
+--- a pick onto the slot the next one is due on, where `run` drops its ask as
+--- one already in flight and the file simply never opens. Both were measured.
+---
+--- A missing pick number is NOT a reason to say nothing. The first command
+--- prints it, so a failure with no number anywhere in front of it never reached
+--- that line — a shell that could not read the script at all — and the first
+--- line of stderr is then the reason worth having. The head before this one
+--- said "the hand-off failed" here and was right to: a file that did not open
+--- must not be left under a clean border.
+---
+--- The number is looked for at the start of any line rather than at the start
+--- of the output, because a launcher can write before the shell it starts ever
+--- reads the script: ssh names a host it has just added to the known ones, a
+--- WSL relay reports a directory it could not enter. An answer whose number is
+--- merely further down still names its pick, and reading only the first line
+--- would both hand this pick a previous one's answer and bury the reason under
+--- a banner. What is left on the number's own line is skipped rather than read
+--- as the reason, and a blank line is stepped over, so a launcher that ends its
+--- lines the Windows way puts neither a carriage return nor nothing at all on
+--- the border.
+local function handoff_failure(id)
+  local answer = (thurbox.runs or {})[state["handoff:" .. id] or ""]
+  if not answer then
+    return nil
+  end
+  if answer.state == "failed" then
+    return answer.error or "the hand-off could not start"
+  end
+  if answer.state ~= "done" or answer.ok then
+    return nil
+  end
+  local err = answer.stderr or ""
+  local named, rest = ("\n" .. err):match("\npick (%d+)[^\n]*(.*)")
+  named = tonumber(named)
+  if named and named ~= state["pick:" .. id] then
+    return nil
+  end
+  if answer.timed_out then
+    return "the hand-off timed out"
+  end
+  if not named then
+    return err:match("^[^\r\n]+") or "the hand-off failed"
+  end
+  return rest:match("\n+([^\r\n]+)") or "the hand-off failed"
+end
+
 --- The editor tab's body: the program's cells under this pane's own border.
 ---
 --- The frame is the SAME one the other two tabs get, strip and all, which is
@@ -1176,6 +1326,21 @@ local function editor_body(session, width, level, border, strip, reserved_left)
       { { text = "no file open", style = { fg = theme.muted } } },
     })
   end
+  -- A hand-off that never reached the editor says so on the border, OVER the
+  -- surface and not instead of it: `program` may have opened this same path
+  -- from `args`, and a page saying the file could not be opened would then
+  -- stand where the file is.
+  local title = " " .. basename(path) .. " (editor) "
+  local warn = nil
+  local why = handoff_failure(session.id)
+  if why then
+    -- The warning LEADS: the title is cut from the right to fit beside the tab
+    -- strip, so a reason put after the name was the first thing to go.
+    title = " not opened: " .. basename(path) .. " · " .. why .. " "
+    -- It replaces the focus badge, so it keeps the badge's two looks.
+    warn = level == "focused" and { fg = theme.role("inverted_fg"), bg = theme.bad, bold = true }
+      or { fg = theme.bad, bold = true }
+  end
 
   return {
     type = "surface",
@@ -1184,10 +1349,12 @@ local function editor_body(session, width, level, border, strip, reserved_left)
     -- boolean here is the kind of key the kernel drops without a word.
     fill = 1,
     frame = border_frame(
-      fit_right_title(" " .. basename(path) .. " (editor) ", width, reserved_left),
+      fit_right_title(title, width, reserved_left),
       level,
       border,
-      strip
+      strip,
+      nil,
+      warn
     ),
   }
 end
@@ -1263,8 +1430,16 @@ end
 --- make it disappear the moment it is replaced: `bufhidden=wipe` drops the
 --- buffer when the window stops showing it, so what is left after the first
 --- file is one window and one listed buffer, measured.
+---
+--- They are set on the `/dev/null` buffer BY NUMBER, not with `setlocal`: `-c`
+--- runs when startup ends, and a file handed over while a slow config was
+--- still loading is the current buffer by then — `setlocal` marked THAT file
+--- unlisted. A `/dev/null` already out of every window is deleted outright,
+--- since `bufhidden` only acts when a buffer is next hidden.
 local WARM_FILE = "/dev/null"
-local WARM_FLAGS = ' -c "setlocal bufhidden=wipe nobuflisted"'
+local WARM_FLAGS = " -c \"lua local b = vim.fn.bufnr('/dev/null') "
+  .. "if b > 0 then vim.bo[b].buflisted = false vim.bo[b].bufhidden = 'wipe' "
+  .. 'if vim.fn.bufwinnr(b) < 0 then vim.api.nvim_buf_delete(b, { force = true }) end end"'
 
 local function start_editor(id, socket, open, cwd, warm)
   command("program", {
@@ -1338,9 +1513,9 @@ end
 --- editor is running: `start_program` is idempotent by contract ("asking for a
 --- pane that exists must be a map lookup and not a second copy"), so the
 --- `program` command starts nvim on the file the first time and does nothing
---- after; the `run` opens the file over RPC when nvim is there and fails
---- harmlessly when it is not — in which case the `program` command it raced has
---- already opened that same path from `args`.
+--- after; the `run` waits for nvim to finish starting and then opens the file
+--- over RPC — when the `program` command started nvim on that same path, the
+--- open is a no-op. See `editor_handoff` for why it waits.
 ---
 --- `--remote-silent` and not `:confirm`: stock nvim ships `hidden` on, where a
 --- modified buffer is hidden rather than refused and the question comes back at
@@ -1375,14 +1550,10 @@ local function ensure_editor(id, path, keep)
     return
   end
   start_editor(id, socket, path, session_cwd(id))
-  -- Keyed on the session and not on the file: this is a side effect, not an
-  -- answer anything reads back, and `refresh` is what makes a second click on
-  -- the same file open it again after the user wandered off in nvim.
-  run(
-    "editoropen:" .. id,
-    SOCKET_DIR .. "; exec nvim --server " .. socket .. " --remote-silent " .. shell_quote(path),
-    { session = id, refresh = true }
-  )
+  -- `refresh` is what makes a second click on the same file open it again after
+  -- the user wandered off in nvim.
+  local key, pick = next_handoff(id)
+  run(key, editor_handoff(id, path, pick), { session = id, refresh = true })
   show_tab(id, EDITOR_TAB, keep)
 end
 
