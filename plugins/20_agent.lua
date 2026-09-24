@@ -1228,9 +1228,45 @@ end
 --- still going.
 ---
 --- `failed` is a run the kernel could not start at all, which carries `error`
---- and no stderr. A `done` answer counts only when it names the latest pick —
---- see `next_handoff` — so a reused key's old failure is not painted over a
---- file that opened.
+--- and no stderr. A `done` answer names its own pick — the hand-off's first
+--- command prints it — so a reused key's old failure is not painted over a file
+--- that opened.
+---
+--- Nothing names a pick on a `failed` answer, and nothing can: it is written on
+--- a worker thread like any other, so it arrives whenever it arrives, and the
+--- ring hands the ninth pick the first one's slot. It is drawn anyway, and that
+--- is a decision rather than an oversight. The wrong it can do is bounded by
+--- the run in flight replacing it, and that bound has three sizes. Against an
+--- editor that has already entered it is 19-21 ms, measured over ten runs.
+--- Against one that is still starting it is that start: the wait wakes about
+--- every hundred milliseconds, and a config of any size takes several of those
+--- — this is the case the wait exists for, the file does open at the end of it,
+--- and the warning standing over it until then is simply false. Against one
+--- that never answers it is the ten-second deadline, and there it is not false
+--- but out of date, because that pick is failing as well. The two ways of
+--- guessing at it from here are bounded by nothing. Suppressing what
+--- cannot be attributed silences a cause that fails every pick, for good, after
+--- the ring's first lap. Choosing a slot the answer can be attributed in moves
+--- a pick onto the slot the next one is due on, where `run` drops its ask as
+--- one already in flight and the file simply never opens. Both were measured.
+---
+--- A missing pick number is NOT a reason to say nothing. The first command
+--- prints it, so a failure with no number anywhere in front of it never reached
+--- that line — a shell that could not read the script at all — and the first
+--- line of stderr is then the reason worth having. The head before this one
+--- said "the hand-off failed" here and was right to: a file that did not open
+--- must not be left under a clean border.
+---
+--- The number is looked for at the start of any line rather than at the start
+--- of the output, because a launcher can write before the shell it starts ever
+--- reads the script: ssh names a host it has just added to the known ones, a
+--- WSL relay reports a directory it could not enter. An answer whose number is
+--- merely further down still names its pick, and reading only the first line
+--- would both hand this pick a previous one's answer and bury the reason under
+--- a banner. What is left on the number's own line is skipped rather than read
+--- as the reason, and a blank line is stepped over, so a launcher that ends its
+--- lines the Windows way puts neither a carriage return nor nothing at all on
+--- the border.
 local function handoff_failure(id)
   local answer = (thurbox.runs or {})[state["handoff:" .. id] or ""]
   if not answer then
@@ -1243,12 +1279,18 @@ local function handoff_failure(id)
     return nil
   end
   local err = answer.stderr or ""
-  if tonumber(err:match("^pick (%d+)")) ~= state["pick:" .. id] then
+  local named, rest = ("\n" .. err):match("\npick (%d+)[^\n]*(.*)")
+  named = tonumber(named)
+  if named and named ~= state["pick:" .. id] then
     return nil
   end
-  return answer.timed_out and "the hand-off timed out"
-    or err:match("\n([^\n]+)")
-    or "the hand-off failed"
+  if answer.timed_out then
+    return "the hand-off timed out"
+  end
+  if not named then
+    return err:match("^[^\r\n]+") or "the hand-off failed"
+  end
+  return rest:match("\n+([^\r\n]+)") or "the hand-off failed"
 end
 
 --- The editor tab's body: the program's cells under this pane's own border.
