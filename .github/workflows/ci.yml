@@ -18,7 +18,7 @@ on:
 # README: its version badge and its `git clone --branch` recipe say this number
 # out loud, and nothing here fails if they drift.
 env:
-  THURBOX_TAG: v2.22.4
+  THURBOX_TAG: v2.64.4
 
 jobs:
   lint:
@@ -67,3 +67,22 @@ jobs:
           XDG_DATA_HOME: ${{ github.workspace }}/build/xdg-data
           THURBOX_UI_DIR: ${{ github.workspace }}/build/ui
         run: ./thurbox-cli plugin check --text
+
+  runtime:
+    name: Files runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Thurbeen/thurbox
+          ref: ${{ env.THURBOX_TAG }}
+          path: .thurbox
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Assemble the interface
+        run: ci/assemble-interface.sh .thurbox build/ui
+      - name: Exercise files in the version-matched kernel
+        env:
+          XDG_CONFIG_HOME: ${{ github.workspace }}/build/xdg-config
+          XDG_DATA_HOME: ${{ github.workspace }}/build/xdg-data
+        run: ci/test-runtime.sh .thurbox build/ui

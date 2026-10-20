@@ -1,7 +1,7 @@
 # thurbox-files
 
 [![CI](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml/badge.svg)](https://github.com/spscream/thurbox-files/actions/workflows/ci.yml)
-[![thurbox v2.22.4](https://img.shields.io/badge/thurbox-v2.22.4-2aa198)](https://github.com/Thurbeen/thurbox/releases/tag/v2.22.4)
+[![thurbox v2.64.4](https://img.shields.io/badge/thurbox-v2.64.4-2aa198)](https://github.com/Thurbeen/thurbox/releases/tag/v2.64.4)
 [![licence MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
 
 A file column for [thurbox](https://github.com/Thurbeen/thurbox) v2, and the two
@@ -59,10 +59,17 @@ end
 
 ## Capabilities
 
-Both are asked for per file, in settings → Interface, and the panes degrade
-rather than break without them.
+Capabilities are granted per file in settings → Interface. On thurbox v2.64.4,
+open settings with **F6**, press **]** to select **Interface**, select
+`thurbox-files/plugins/90_files.lua`, and press **t** to grant its declared
+capabilities. Review the requested access before granting. The plugin cannot
+grant itself access; updating it may require a new grant.
 
-- `90_files.lua` — `run`, for the Changes tab. Untrusted, the tree still draws.
+- `90_files.lua` — `files`, to list the selected session’s working directory,
+  and `run`, for git information and context-menu file operations. Without a
+  grant, the tree displays “not trusted to list files” and the settings action
+  above; the Changes tab displays “not trusted to read git”. After granting,
+  directory navigation works normally; press `r` to re-read external changes.
 - `20_agent.lua` — `program` (the editor is a program this pane starts) and
   `run` (the diff it shows for one path, and every file after the first: the
   editor is started as `nvim --listen <socket>` and later files are handed to it
@@ -98,7 +105,7 @@ files.
 
 ## Checks
 
-Two jobs, both of which a pane can fail without anyone opening a terminal.
+Three checks run without opening the live interface.
 
 - **Lua** — `selene` against `thurbox.yml`, the plugin VM's real standard
   library, so a pane reaching for something the sandbox withholds is a lint
@@ -109,15 +116,20 @@ Two jobs, both of which a pane can fail without anyone opening a terminal.
   `thurbox-cli plugin check` against it. A pane that loads but that nothing
   places exits non-zero, which is the "empty column" failure caught early.
 
-Both run against the release named by `THURBOX_TAG` in the workflow — the binary
+- **Files runtime** — loads the assembled plugin in the real kernel, exercises
+  missing trust, a valid listing, directory expand/collapse, reload, and
+  revoking/regranting access. Grants exist only in the disposable test host.
+
+All run against the release named by `THURBOX_TAG` in the workflow — the binary
 and the `ui/` tree it loads have to be the same version. Locally:
 
 ```bash
-git clone --depth 1 --branch v2.22.4 https://github.com/Thurbeen/thurbox .thurbox
+git clone --depth 1 --branch v2.64.4 https://github.com/Thurbeen/thurbox .thurbox
 cp .thurbox/thurbox.yml .          # what selene.toml's `std = "thurbox"` resolves to
 selene plugins && stylua --check plugins
 ci/assemble-interface.sh .thurbox build/ui
 THURBOX_UI_DIR=$PWD/build/ui thurbox-cli plugin check
+ci/test-runtime.sh .thurbox build/ui   # requires the Rust toolchain
 ```
 
 ## The recording
