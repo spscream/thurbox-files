@@ -364,6 +364,9 @@ end
 --- Directories first, then names, both case-insensitively — the order a file
 --- tree is read in, not the order the filesystem happened to hand back.
 local function listing(session, path)
+  if not files then
+    return nil, "not trusted to list files"
+  end
   local ok, listed = pcall(files.list, session, path)
   if not ok then
     -- A session on a remote or WSL backend can be one this thurbox cannot read
@@ -436,6 +439,11 @@ end
 --- to sort it would only be re-deriving what the walk already knows. Only open
 --- directories are listed, so the cost is the rows on screen, not the worktree.
 local function visible_rows(session)
+  -- Never keep rows (or a missing-grant error) across a capability change.
+  if not files then
+    cache = {}
+    return nil, "not trusted to list files"
+  end
   local open = expanded_set()
   local stamp = state.stamp or 0
   local sig = signature(session, open)
@@ -569,6 +577,9 @@ local function lists_as_dir(session, path)
   local known = linked[key]
   if known ~= nil then
     return known
+  end
+  if not files then
+    return false
   end
   local ok = pcall(files.list, session, path)
   linked[key] = ok
@@ -1116,11 +1127,12 @@ return {
     { action = SELECT_CHANGES, desc = "show the changed files" },
   },
 
+  -- Directory listings require `files`; git and file operations require `run`.
   -- `git status` and `git diff`, in the SESSION's working directory and on the
   -- session's host — which is what makes the column right for a session that
   -- does not live on this machine. `run` is absent until the user trusts this
   -- file, and every read of it above degrades rather than fails.
-  capabilities = { "run" },
+  capabilities = { "files", "run" },
 
   -- The context menu's answer. The menu holds no capability of its own, so the
   -- verb travels to the one plugin that does — see `95_files_menu.lua`.
@@ -1152,7 +1164,7 @@ return {
       })
     end
 
-    local function nothing(title, hint, hint_action)
+    local function nothing(title, hint, hint_action, note)
       return framed(ui.list({
         items = {},
         width = width,
@@ -1162,6 +1174,7 @@ return {
           width = width,
           hint = hint,
           hint_action = hint_action,
+          note = note,
         }),
         pad = true,
       }))
@@ -1176,7 +1189,11 @@ return {
         -- Honest rather than empty: this pane cannot grant itself the
         -- capability, and an empty "Changes" tab is indistinguishable from a
         -- clean tree.
-        return nothing("not trusted to read git", "F6 → ] → t grants it")
+        return nothing("not trusted to read git", nil, nil, {
+          "F6 → ] Interface",
+          "select 90_files.lua",
+          "t grants files + run",
+        })
       end
       if not index then
         return nothing(why == "failed" and "not a git repository" or "reading git status…")
@@ -1204,6 +1221,14 @@ return {
 
     local rows, err = visible_rows(session)
     if not rows then
+      if not files then
+        return nothing(
+          "not trusted to list files",
+          nil,
+          nil,
+          { "F6 → ] Interface", "select 90_files.lua", "t grants files + run" }
+        )
+      end
       return nothing("unreadable: " .. err)
     end
 
